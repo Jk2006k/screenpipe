@@ -15,6 +15,7 @@ describe("buildChatTestBody", () => {
     expect(body).toEqual({
       model: "gpt-4",
       messages: [{ role: "user", content: "say hi" }],
+      stream: false,
       max_tokens: 50,
     });
     expect(body.max_completion_tokens).toBeUndefined();
@@ -25,6 +26,7 @@ describe("buildChatTestBody", () => {
     expect(body).toEqual({
       model: "gpt-5",
       messages: [{ role: "user", content: "say hi" }],
+      stream: false,
       max_completion_tokens: 50,
     });
     expect(body.max_tokens).toBeUndefined();

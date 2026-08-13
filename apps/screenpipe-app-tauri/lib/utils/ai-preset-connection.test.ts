@@ -35,6 +35,39 @@ describe("testAiPresetConnection", () => {
     expect(JSON.parse(request.mock.calls[0][1]!.body as string)).toMatchObject({
       model: "model-1",
       max_tokens: 50,
+      stream: false,
+    });
+  });
+
+  it("explicitly disables streaming for OpenAI-compatible gateways", async () => {
+    const request = vi.fn(async (_input: string, init?: RequestInit) => {
+      const body = JSON.parse(init?.body as string);
+      if (body.stream !== false) {
+        return new Response(
+          'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n',
+          { status: 200, headers: { "Content-Type": "text/event-stream" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({ choices: [{ message: { content: "hi" } }] }),
+        { status: 200 },
+      );
+    });
+
+    await expect(
+      testAiPresetConnection(
+        {
+          provider: "custom",
+          url: "https://gateway.example.com/v1",
+          model: "model-1",
+          apiKey: "secret",
+        },
+        { fetch: request },
+      ),
+    ).resolves.toMatchObject({ reply: "hi" });
+
+    expect(JSON.parse(request.mock.calls[0][1]!.body as string)).toMatchObject({
+      stream: false,
     });
   });
 
@@ -94,6 +127,7 @@ describe("testAiPresetConnection", () => {
     expect(JSON.parse(request.mock.calls[1][1]!.body as string)).toMatchObject({
       model: "gpt-5",
       max_completion_tokens: 50,
+      stream: false,
     });
   });
 });

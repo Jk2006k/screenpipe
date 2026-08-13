@@ -21,6 +21,7 @@ export type ChatTokensField = "max_tokens" | "max_completion_tokens";
 export interface ChatTestBody {
   model: string;
   messages: Array<{ role: string; content: string }>;
+  stream: false;
   max_tokens?: number;
   max_completion_tokens?: number;
 }
@@ -37,6 +38,7 @@ export function buildChatTestBody(
   const body: ChatTestBody = {
     model,
     messages: [{ role: "user", content: prompt }],
+    stream: false,
   };
   if (tokensField === "max_tokens") {
     body.max_tokens = maxTokens;
