@@ -19,10 +19,9 @@ use serde_json::{Map, Value};
 //   Mail.Read, Mail.ReadWrite, Mail.Send,
 //   Calendars.Read, Calendars.ReadWrite,
 //   Files.Read, Files.ReadWrite,
-//   Chat.ReadWrite, Team.ReadBasic.All,
-//   ChannelMessage.Read.All  (requires tenant admin consent at
-//     https://login.microsoftonline.com/<tenant>/adminconsent — other scopes
-//     work with standard user consent).
+//   Chat.ReadWrite, Team.ReadBasic.All.
+// All requested scopes work with standard user consent. Admin-consent-only
+// scopes belong in a separate, explicit consent flow rather than the default.
 static OAUTH: OAuthConfig = OAuthConfig {
     auth_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
     client_id: "be765a6d-62fd-4abe-9703-3ffcfee711b9",
@@ -34,7 +33,7 @@ static OAUTH: OAuthConfig = OAuthConfig {
              Calendars.Read Calendars.ReadWrite \
              Files.Read Files.ReadWrite \
              Chat.ReadWrite \
-             Team.ReadBasic.All ChannelMessage.Read.All",
+             Team.ReadBasic.All",
         ),
         // select_account so a second connect shows Microsoft's account picker
         // instead of silently consenting under the already-signed-in account —
@@ -132,5 +131,50 @@ impl Integration for Microsoft365 {
 
         let name = resp["displayName"].as_str().unwrap_or("unknown");
         Ok(format!("connected as {}", name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_scopes() -> Vec<&'static str> {
+        Microsoft365
+            .oauth_config()
+            .expect("microsoft365 uses OAuth")
+            .extra_auth_params
+            .iter()
+            .find(|(key, _)| *key == "scope")
+            .map(|(_, value)| value.split_whitespace().collect())
+            .expect("scope param present")
+    }
+
+    #[test]
+    fn default_scope_excludes_admin_consent_only_channel_messages() {
+        assert!(!default_scopes().contains(&"ChannelMessage.Read.All"));
+    }
+
+    #[test]
+    fn default_scope_retains_microsoft365_access() {
+        let scopes = default_scopes();
+        for required in [
+            "offline_access",
+            "openid",
+            "profile",
+            "Mail.Read",
+            "Mail.ReadWrite",
+            "Mail.Send",
+            "Calendars.Read",
+            "Calendars.ReadWrite",
+            "Files.Read",
+            "Files.ReadWrite",
+            "Chat.ReadWrite",
+            "Team.ReadBasic.All",
+        ] {
+            assert!(
+                scopes.contains(&required),
+                "missing required scope: {required}"
+            );
+        }
     }
 }
