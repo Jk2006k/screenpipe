@@ -18,6 +18,15 @@ import { cn } from "@/lib/utils";
 import { screenpipeWebUrl } from "@/lib/web-url";
 import { enterpriseUpdateAuthHeaders } from "@/lib/enterprise-auth-recovery";
 import { flushPendingSettingsWrites } from "@/lib/hooks/use-settings";
+import posthog from "posthog-js";
+
+function trackUpdateEvent(event: string, properties: Record<string, unknown>) {
+  try {
+    posthog.capture(event, properties);
+  } catch {
+    // Telemetry must never affect the updater.
+  }
+}
 
 interface UpdateInfo {
   version: string;
@@ -106,6 +115,7 @@ export function UpdateBanner({ className, compact = false, variant = "default" }
   const handleUpdate = async () => {
     setIsInstalling(true);
     const os = platform();
+    let failureStage = os === "windows" ? "download" : "verification";
 
     try {
       // A user can enable Auto-update and immediately click this banner. The
@@ -167,9 +177,17 @@ export function UpdateBanner({ className, compact = false, variant = "default" }
         }
 
         if (update?.available) {
-
-
-          await update.downloadAndInstall(undefined, downloadOptions);
+          await update.downloadAndInstall((event) => {
+            if (event.event === "Finished") {
+              failureStage = "install";
+              trackUpdateEvent("update_downloaded", {
+                target_version: update.version,
+              });
+              trackUpdateEvent("update_installation_started", {
+                target_version: update.version,
+              });
+            }
+          }, downloadOptions);
 
           toast({
             title: "update complete",
@@ -208,6 +226,10 @@ export function UpdateBanner({ className, compact = false, variant = "default" }
       }
     } catch (error) {
       console.error("failed to update:", error);
+      trackUpdateEvent("update_failed", {
+        stage: failureStage,
+        target_version: updateInfo?.version,
+      });
       setIsInstalling(false);
       toast({
         title: "update failed",

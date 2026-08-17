@@ -226,6 +226,13 @@ jobs:
                   should_resolve, reason = should_resolve_version(current_version, event_version)
                   context = issue_context(issue, event, release_tag, full_ver, gap, reason)
 
+                  # This issue means the updater failed to advance the app, so
+                  # its old release is evidence of persistence, not staleness.
+                  if short_id == "SCREENPIPE-APP-K7":
+                      print(f"  SKIP [{short_id}] updater-verification {context} {event_count} events, {user_count} users - {title}")
+                      skipped_count += 1
+                      continue
+
                   # Skip if has assignee (someone is working on it)
                   if assignee:
                       print(f"  SKIP [{short_id}] has assignee {context} {event_count} events, {user_count} users - {title}")

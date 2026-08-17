@@ -25,6 +25,19 @@ use tokio::sync::oneshot;
 use tokio::sync::Mutex;
 use tokio::time::interval;
 
+/// Best-effort updater telemetry. It must never delay or affect updating.
+fn track_update_event(app: &tauri::AppHandle, event: &'static str, properties: serde_json::Value) {
+    let Some(analytics) = app.try_state::<Arc<crate::analytics::AnalyticsManager>>() else {
+        return;
+    };
+    let analytics = analytics.inner().clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = analytics.send_event(event, Some(properties)).await {
+            warn!("failed to send updater telemetry event {}: {}", event, e);
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Rollback: download a specific older version from R2 via the website API
 // ---------------------------------------------------------------------------
@@ -346,6 +359,11 @@ pub async fn restart_for_update(
     // detected instead of the app just quietly staying old.
     #[cfg(target_os = "macos")]
     if let Some(to_version) = crate::staged_update::staged_version() {
+        track_update_event(
+            &app,
+            "update_installation_started",
+            serde_json::json!({ "target_version": to_version }),
+        );
         record_update_attempt(&app, &to_version);
     }
 
@@ -791,6 +809,17 @@ impl UpdatesManager {
 
         // Did the previous process quit to apply an update that never landed?
         let failed_attempt = consume_update_attempt_marker(app);
+        if let Some(attempt) = &failed_attempt {
+            track_update_event(
+                app,
+                "update_failed",
+                serde_json::json!({
+                    "stage": "verification",
+                    "from_version": attempt.from_version,
+                    "target_version": attempt.to_version,
+                }),
+            );
+        }
 
         let update_menu_item = if is_enterprise_build(app) {
             None
@@ -932,6 +961,11 @@ impl UpdatesManager {
                 // issues or "endpoints not set" on source builds; neither is actionable.
                 // Sentry would just get noise.
                 warn!("updater check() error: {}", e);
+                track_update_event(
+                    &self.app,
+                    "update_failed",
+                    serde_json::json!({ "stage": "check" }),
+                );
             }
         }
         if let Ok(Some(update)) = check_result {
@@ -1003,6 +1037,15 @@ impl UpdatesManager {
             });
 
             let auto_update = load_auto_update_enabled(&self.app);
+            track_update_event(
+                &self.app,
+                "update_available",
+                serde_json::json!({
+                    "current_version": current_version,
+                    "target_version": update.version,
+                    "auto_update": auto_update,
+                }),
+            );
 
             if let Some(ref item) = self.update_menu_item {
                 item.set_enabled(true)?;
@@ -1119,12 +1162,16 @@ impl UpdatesManager {
                 Duration::from_secs(120),
                 Duration::from_secs(300),
             ];
+            let installation_started = Arc::new(AtomicBool::new(false));
             let download_result = {
                 let mut attempt: usize = 0;
                 loop {
                     let app_handle = self.app.clone();
                     let update_version = update.version.clone();
                     let menu_item = self.update_menu_item.clone();
+                    let telemetry_app = self.app.clone();
+                    let telemetry_version = update.version.clone();
+                    let installation_started_callback = installation_started.clone();
                     let mut downloaded: u64 = 0;
                     let mut last_pct: u8 = 0;
                     let on_chunk = move |chunk_len: usize, content_len: Option<u64>| {
@@ -1178,7 +1225,21 @@ impl UpdatesManager {
                         Err(e) => Err(e),
                     };
                     #[cfg(not(target_os = "macos"))]
-                    let result = update.download_and_install(on_chunk, || {}).await;
+                    let result = update
+                        .download_and_install(on_chunk, move || {
+                            installation_started_callback.store(true, Ordering::SeqCst);
+                            track_update_event(
+                                &telemetry_app,
+                                "update_downloaded",
+                                serde_json::json!({ "target_version": telemetry_version }),
+                            );
+                            track_update_event(
+                                &telemetry_app,
+                                "update_installation_started",
+                                serde_json::json!({ "target_version": telemetry_version }),
+                            );
+                        })
+                        .await;
 
                     match &result {
                         Ok(_) => break result,
@@ -1226,6 +1287,12 @@ impl UpdatesManager {
 
             match download_result {
                 Ok(_) => {
+                    #[cfg(target_os = "macos")]
+                    track_update_event(
+                        &self.app,
+                        "update_downloaded",
+                        serde_json::json!({ "target_version": update.version }),
+                    );
                     // Clear any prior failure marker — this version is good now.
                     *self.last_failed_update.lock().await = None;
                     *self.update_installed.lock().await = true;
@@ -1244,6 +1311,14 @@ impl UpdatesManager {
                         || err_str.contains("Unauthorized")
                         || err_str.contains("Forbidden")
                     {
+                        track_update_event(
+                            &self.app,
+                            "update_failed",
+                            serde_json::json!({
+                                "stage": "download",
+                                "target_version": update.version,
+                            }),
+                        );
                         warn!("update download requires authentication: {}", err_str);
                         if let Some(snap) = self.pending_update.lock().await.as_mut() {
                             snap.auth_required = true;
@@ -1278,6 +1353,19 @@ impl UpdatesManager {
                     // us from re-downloading this same broken bundle every 5 min
                     // (the auto-update download-loop fix).
                     warn!("update download failed after retries: {}", err_str);
+                    let failure_stage = if installation_started.load(Ordering::SeqCst) {
+                        "install"
+                    } else {
+                        "download"
+                    };
+                    track_update_event(
+                        &self.app,
+                        "update_failed",
+                        serde_json::json!({
+                            "stage": failure_stage,
+                            "target_version": update.version,
+                        }),
+                    );
                     *self.last_failed_update.lock().await =
                         Some((update.version.clone(), std::time::Instant::now()));
                     *self.update_available.lock().await = false;
@@ -1574,6 +1662,14 @@ fn check_whats_new(app: &tauri::AppHandle) {
     info!(
         "app upgraded from v{} to v{}, scheduling what's-new notification",
         old_version, current_version
+    );
+    track_update_event(
+        app,
+        "update_installed",
+        serde_json::json!({
+            "from_version": old_version,
+            "installed_version": current_version,
+        }),
     );
 
     tokio::spawn(async move {

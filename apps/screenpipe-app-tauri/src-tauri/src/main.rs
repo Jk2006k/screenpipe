@@ -2073,17 +2073,6 @@ async fn main() {
                 }
             }
 
-            // Initialize update check
-            let update_manager = start_update_check(&app_handle, 5)?;
-            app_handle.manage(update_manager.clone()); // Register for state::<Arc<UpdatesManager>>()
-
-            // Setup tray
-            if let Some(_) = app_handle.tray_by_id("screenpipe_main") {
-                if let Err(e) = tray::setup_tray(&app_handle, update_manager.update_now_menu_item_ref()) {
-                    error!("Failed to setup tray: {}", e);
-                }
-            }
-
             // Log tray icon position for diagnostics.
             // On notched MacBooks with many menu bar icons, the tray can land behind
             // the notch. Users can Cmd+drag it to a visible position.
@@ -2147,6 +2136,18 @@ async fn main() {
                     Err(e) => {
                         error!("Failed to start analytics: {}", e);
                     }
+                }
+            }
+
+            // Initialize update checks after analytics so boot-time updater
+            // lifecycle events can use the existing telemetry manager.
+            let update_manager = start_update_check(&app_handle, 5)?;
+            app_handle.manage(update_manager.clone()); // Register for state::<Arc<UpdatesManager>>()
+
+            // Setup tray
+            if let Some(_) = app_handle.tray_by_id("screenpipe_main") {
+                if let Err(e) = tray::setup_tray(&app_handle, update_manager.update_now_menu_item_ref()) {
+                    error!("Failed to setup tray: {}", e);
                 }
             }
 
