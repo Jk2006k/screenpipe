@@ -22,9 +22,25 @@ use tracing::{error, info, warn};
 #[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
 use crate::utils::audio::audio_to_mono;
 
-#[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
-use super::device::get_cpal_device_and_config;
 use super::device::AudioDevice;
+#[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
+use super::device::{bluetooth_input_is_combo_headset, get_cpal_device_and_config};
+#[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
+use super::device_detection::InputDeviceKind;
+
+#[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
+fn input_vpio_allowed(
+    requested: bool,
+    is_input: bool,
+    is_default_input: bool,
+    input_kind: &InputDeviceKind,
+    is_combo_headset: bool,
+) -> bool {
+    requested
+        && is_input
+        && is_default_input
+        && !(input_kind == &InputDeviceKind::Bluetooth && is_combo_headset)
+}
 
 /// Backend-agnostic audio stream configuration.
 /// Replaces direct use of `cpal::SupportedStreamConfig` so that alternative
@@ -313,9 +329,25 @@ impl AudioStream {
         let (cpal_audio_device, mut config) = get_cpal_device_and_config(device).await?;
         let is_running_weak = Arc::downgrade(is_running);
         let input_aec = windows_input_aec && device.device_type == super::device::DeviceType::Input;
-        let input_vpio = macos_input_vpio
-            && device.device_type == super::device::DeviceType::Input
-            && is_default_input_device(device);
+        let is_input = device.device_type == super::device::DeviceType::Input;
+        // Preserve the old short-circuiting behavior: querying the system
+        // default and transport metadata is only needed for an eligible VPIO
+        // input, never for ordinary HAL streams or outputs.
+        let is_default_input = macos_input_vpio && is_input && is_default_input_device(device);
+        let input_kind = if is_default_input {
+            InputDeviceKind::detect_input(&device.name)
+        } else {
+            InputDeviceKind::Unknown
+        };
+        let is_bluetooth_combo = input_kind == InputDeviceKind::Bluetooth
+            && bluetooth_input_is_combo_headset(&device.name);
+        let input_vpio = input_vpio_allowed(
+            macos_input_vpio,
+            is_input,
+            is_default_input,
+            &input_kind,
+            is_bluetooth_combo,
+        );
 
         #[cfg(target_os = "macos")]
         {
@@ -348,10 +380,15 @@ impl AudioStream {
                     channels = config.channels(),
                     "screenpipe-audio: using default input config for VoiceProcessingIO"
                 );
-            } else if macos_input_vpio && device.device_type == super::device::DeviceType::Input {
+            } else if macos_input_vpio && is_input {
                 info!(
                     device = %device,
-                    "screenpipe-audio: macOS VPIO requested but using HAL (only system default input supports VoiceProcessingIO)"
+                    reason = if is_bluetooth_combo {
+                        "Bluetooth combo headsets must remain on the passive HAL path"
+                    } else {
+                        "only the system default input supports VoiceProcessingIO"
+                    },
+                    "screenpipe-audio: macOS VPIO requested but using HAL"
                 );
             }
         }
@@ -815,6 +852,41 @@ fn is_wasapi_unsupported_format(err: &anyhow::Error) -> bool {
         // (seen on Logitech C922 and other USB mics). The existing fallback to
         // default_input_config() already handles this correctly once we match it.
         || s.to_lowercase().contains("not supported by the device")
+}
+
+#[cfg(all(test, not(all(target_os = "linux", feature = "pulseaudio"))))]
+mod vpio_eligibility_tests {
+    use super::{input_vpio_allowed, InputDeviceKind};
+
+    #[test]
+    fn bluetooth_combo_headset_never_uses_vpio() {
+        assert!(!input_vpio_allowed(
+            true,
+            true,
+            true,
+            &InputDeviceKind::Bluetooth,
+            true,
+        ));
+
+        assert!(input_vpio_allowed(
+            true,
+            true,
+            true,
+            &InputDeviceKind::Bluetooth,
+            false,
+        ));
+    }
+
+    #[test]
+    fn default_non_bluetooth_input_can_use_vpio() {
+        assert!(input_vpio_allowed(
+            true,
+            true,
+            true,
+            &InputDeviceKind::Wired,
+            false,
+        ));
+    }
 }
 
 #[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
