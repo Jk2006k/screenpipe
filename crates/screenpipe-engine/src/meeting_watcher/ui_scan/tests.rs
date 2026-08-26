@@ -7,6 +7,21 @@
 use super::*;
 
 #[test]
+fn failed_meeting_insert_returns_detector_to_idle_for_retry() {
+    let now = std::time::Instant::now();
+    let mut state = MeetingState::Active {
+        meeting_id: -1,
+        app: "Zoom".to_string(),
+        started_at: chrono::Utc::now(),
+        last_seen: now,
+        is_browser: false,
+    };
+
+    assert!(!persist_started_meeting_state(&mut state, -1));
+    assert!(matches!(state, MeetingState::Idle));
+}
+
+#[test]
 fn output_audio_keepalive_requires_real_voice_not_just_a_chunk() {
     // The system-audio tap writes a recent (output) chunk continuously, even
     // during silence — that alone must NOT keep an ended call alive, or a

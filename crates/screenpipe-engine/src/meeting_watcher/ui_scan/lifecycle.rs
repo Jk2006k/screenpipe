@@ -293,6 +293,32 @@ pub(crate) async fn handle_no_apps_path(
 /// it with overlapping calendar data, replaces the placeholder meeting id in
 /// state, and emits detection telemetry. `EndMeeting` performs the natural
 /// grace-timeout end (end_reason left NULL so the merge window still applies).
+pub(crate) fn persist_started_meeting_state(state: &mut MeetingState, meeting_id: i64) -> bool {
+    if meeting_id < 0 {
+        *state = MeetingState::Idle;
+        return false;
+    }
+
+    // Update state with actual meeting ID (replace the placeholder -1).
+    if let MeetingState::Active {
+        app: ref a,
+        started_at,
+        last_seen,
+        is_browser,
+        ..
+    } = *state
+    {
+        *state = MeetingState::Active {
+            meeting_id,
+            app: a.clone(),
+            started_at,
+            last_seen,
+            is_browser,
+        };
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_state_action(
     action: StateAction,
@@ -389,23 +415,23 @@ pub(crate) async fn apply_state_action(
                 }
             };
 
-            // Update state with actual meeting ID (replace the placeholder -1)
-            if let MeetingState::Active {
-                app: ref a,
-                started_at,
-                last_seen,
-                is_browser,
-                ..
-            } = *state
-            {
-                *state = MeetingState::Active {
-                    meeting_id,
-                    app: a.clone(),
-                    started_at,
-                    last_seen,
-                    is_browser,
-                };
+            // `insert_new_meeting` returns -1 on a persistence failure. Do not
+            // turn that sentinel into an Active state: doing so makes the
+            // detector believe the call is already tracked and prevents every
+            // subsequent scan from retrying the insert. This was particularly
+            // misleading in support logs because audio could continue while no
+            // meeting row was ever created.
+            if !persist_started_meeting_state(state, meeting_id) {
+                error!(
+                    app = %app,
+                    "meeting v2: detector observed a call but could not persist its meeting row; returning to idle so the next scan retries"
+                );
+                if let Ok(status) = resolve_meeting_status_from(db, manual_meeting).await {
+                    emit_meeting_status_changed(&status);
+                }
+                return;
             }
+
             if let Ok(status) = resolve_meeting_status_from(db, manual_meeting).await {
                 emit_meeting_status_changed(&status);
             }
