@@ -148,14 +148,49 @@ describe("selectWorktreeRepository", () => {
     expect(mocks.stop).toHaveBeenCalledWith(sessionId);
   });
 
-  it("prefers the first ranked checkout when candidates share an explicit repository name", () => {
+  it("does not guess when checkouts share an explicit repository name", () => {
     expect(
       deterministicRepositoryCandidate({
         task: "fix the screenpipe repo",
         candidates: ["/repos/one/screenpipe", "/repos/two/screenpipe"],
         startingPath: "/tmp/task",
       }),
-    ).toBe("/repos/one/screenpipe");
+    ).toBeNull();
+  });
+
+  it.each<[string, string[], string | null]>([
+    ["fix screenpipe and website-screenpipe", ["/repos/screenpipe", "/repos/website-screenpipe"], null],
+    ["fix website-screenpipe", ["/repos/screenpipe"], null],
+    ["fix my.app", ["/repos/my-app"], null],
+    ["fix my-app", ["/repos/my.app", "/repos/my-app"], "/repos/my-app"],
+    ["fix api", ["/repos/api"], "/repos/api"],
+    ["fix screenpipe.", ["/repos/screenpipe"], "/repos/screenpipe"],
+    ["fix screenpipe.dev", ["/repos/screenpipe"], null],
+    ["fix my.app", ["/repos/my.app"], "/repos/my.app"],
+    ["fix /repos/two/screenpipe", ["/repos/one/screenpipe", "/repos/two/screenpipe"], "/repos/two/screenpipe"],
+    ["fix /other/screenpipe", ["/repos/screenpipe"], null],
+    ["fix /repos/app", ["/repos/App"], null],
+    ["fix C:\\Repos\\App", ["C:\\repos\\app"], "C:\\repos\\app"],
+  ])("routes exact mentions safely: %s", (task, candidates, expected) => {
+    expect(deterministicRepositoryCandidate({
+      task, candidates, startingPath: "/tmp/task",
+    })).toBe(expected);
+  });
+
+  it("distinguishes case-sensitive checkout paths", () => {
+    expect(deterministicRepositoryCandidate({
+      task: "fix the button",
+      candidates: ["/repos/app", "/repos/App"],
+      startingPath: "/repos/App/src",
+    })).toBe("/repos/App");
+  });
+
+  it("recognizes Windows path separators and case", () => {
+    expect(deterministicRepositoryCandidate({
+      task: "fix the button",
+      candidates: ["C:\\Repos\\App"],
+      startingPath: "c:/repos/app/src",
+    })).toBe("C:\\Repos\\App");
   });
 
   it("does not partially match a related repository name", () => {

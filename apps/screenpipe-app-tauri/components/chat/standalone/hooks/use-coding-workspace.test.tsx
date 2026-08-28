@@ -349,7 +349,7 @@ describe("useCodingWorkspace", () => {
     expect(hook.result.current.error).toBeNull();
   });
 
-  it("disarms worktree mode when repository selection fails", async () => {
+  it("keeps isolation armed and retries when repository selection fails", async () => {
     mocks.get.mockResolvedValue({ status: "ok", data: null });
     mocks.prepare.mockResolvedValue({
       status: "ok",
@@ -377,10 +377,43 @@ describe("useCodingWorkspace", () => {
       await hook.result.current.prepareForPrompt("make the button blue", router);
     });
 
-    expect(hook.result.current.enabled).toBe(false);
+    expect(hook.result.current.enabled).toBe(true);
     expect(hook.result.current.isLoading).toBe(false);
     expect(hook.result.current.error).toBe(
       "The AI did not choose a repository",
     );
+
+    mocks.route.mockResolvedValue(workspace("conversation-a"));
+    await act(async () => {
+      const retried = await hook.result.current.prepareForPrompt("make the button blue", router);
+      expect(retried.ok).toBe(true);
+      expect(retried.created).toBe(true);
+    });
+    expect(mocks.prepare).toHaveBeenCalledTimes(2);
+    expect(mocks.route).toHaveBeenCalledTimes(2);
+    expect(hook.result.current.error).toBeNull();
+  });
+
+  it("does not bypass isolation on repeated repository discovery failures", async () => {
+    mocks.get.mockResolvedValue({ status: "ok", data: null });
+    mocks.prepare.mockResolvedValue({
+      status: "ok",
+      data: { status: "not_found", workspace: null, candidates: [], routeSessionId: null },
+    });
+    const hook = renderHook(() =>
+      useCodingWorkspace({ conversationId: "conversation-a", locked: false }),
+    );
+    await waitFor(() => expect(hook.result.current.isLoading).toBe(false));
+    await act(async () => { await hook.result.current.toggleWorktree(true); });
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await act(async () => {
+        const result = await hook.result.current.prepareForPrompt("fix the button", router);
+        expect(result.ok).toBe(false);
+      });
+      expect(hook.result.current.enabled).toBe(true);
+    }
+    expect(mocks.prepare).toHaveBeenCalledTimes(2);
+    expect(mocks.route).not.toHaveBeenCalled();
   });
 });

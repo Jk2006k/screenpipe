@@ -260,7 +260,6 @@ export function useCodingWorkspace({
             generation === requestGenerationRef.current &&
             conversationIdRef.current === requestConversationId
           ) {
-            setEnabled(false);
             setError(message);
             toast({
               title: "could not resolve a coding repository",
@@ -296,7 +295,9 @@ export function useCodingWorkspace({
           generation === requestGenerationRef.current &&
           conversationIdRef.current === requestConversationId
         ) {
-          setEnabled(false);
+          // A failed preflight must remain fail-closed. Keep isolation armed
+          // so sending the same prompt retries preparation, not the agent in
+          // its ordinary (non-isolated) working directory.
           setError(message);
           toast({
             title: "could not create coding workspace",

@@ -111,7 +111,7 @@ export function ComposerWorktreeToggle({
               {error}
             </p>
             <p className="text-[10px] text-muted-foreground">
-              send again to continue without an isolated worktree.
+              your message was not sent. send again to retry workspace setup.
             </p>
           </PopoverContent>
         </Popover>

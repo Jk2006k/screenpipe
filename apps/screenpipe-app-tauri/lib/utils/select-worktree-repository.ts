@@ -14,22 +14,25 @@ const ROUTE_TIMEOUT_MS = 15_000;
 const ROUTE_POLL_MS = 100;
 
 function normalizedPath(value: string): string {
-  return value.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  const path = value.replace(/\\/g, "/").replace(/\/+$/, "");
+  // Only Windows paths have a case-insensitive identity here. Folding POSIX
+  // paths can silently route /repos/App into a different checkout /repos/app.
+  return /^(?:[a-z]:\/|\/\/)/i.test(path) ? path.toLowerCase() : path;
 }
 
-function normalizedWords(value: string): string {
-  return value
-    .normalize("NFKD")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
+function mentionsExactly(task: string, value: string, ignoreCase = true): boolean {
+  const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // Preserve punctuation: "website-screenpipe" is not a mention of
+  // "screenpipe", and "my.app" is not the same name as "my-app".
+  return new RegExp(
+    `(?:^|[^\\p{L}\\p{N}_./\\\\-])${escaped}(?=$|[^\\p{L}\\p{N}_./\\\\-]|\\.(?=$|\\s))`,
+    ignoreCase ? "iu" : "u",
+  ).test(task);
 }
 
 function repositoryName(repositoryPath: string): string {
   const path = normalizedPath(repositoryPath);
-  return normalizedWords(
-    path.slice(path.lastIndexOf("/") + 1).replace(/\.git$/, ""),
-  );
+  return path.slice(path.lastIndexOf("/") + 1);
 }
 
 /**
@@ -37,9 +40,9 @@ function repositoryName(repositoryPath: string): string {
  *
  * The starting directory owns the strongest signal: a coding task launched
  * from inside a repository belongs to that repository. Outside a repository,
- * accept an exact, full repository-name mention and preserve discovery order
- * when multiple checkouts share that name. Discovery already ranks the current
- * and most recently active repositories first. Partial keyword scoring stays
+ * accept an unambiguous, exact repository path or full repository-name mention.
+ * Discovery order is not evidence when multiple checkouts share that name.
+ * Partial keyword scoring stays
  * deliberately out of this path so "screenpipe" cannot silently choose
  * "website-screenpipe", and ambiguous requests still reach the constrained
  * router agent.
@@ -70,16 +73,19 @@ export function deterministicRepositoryCandidate({
     if (containing.length > 0) return containing[0];
   }
 
-  const normalizedTask = ` ${normalizedWords(task)} `;
-  const matches = candidates
-    .map((candidate) => ({ candidate, name: repositoryName(candidate) }))
-    .filter(
-      ({ name }) => name.length >= 4 && normalizedTask.includes(` ${name} `),
-    )
-    .sort((left, right) => right.name.length - left.name.length);
-  if (matches.length === 0) return null;
+  const paths = candidates.filter((candidate) =>
+    mentionsExactly(
+      task.replace(/\\/g, "/"),
+      candidate.replace(/\\/g, "/"),
+      /^(?:[a-z]:[\\/]|[\\/]{2})/i.test(candidate),
+    ),
+  );
+  if (paths.length > 0) return paths.length === 1 ? paths[0] : null;
 
-  return matches[0].candidate;
+  const matches = candidates.filter((candidate) =>
+    mentionsExactly(task, repositoryName(candidate)),
+  );
+  return matches.length === 1 ? matches[0] : null;
 }
 
 function routerPrompt(
