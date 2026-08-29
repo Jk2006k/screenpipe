@@ -635,21 +635,33 @@ async fn probe_server_health(health_url: &str, api_key: Option<&str>) -> bool {
         if let Some(key) = api_key {
             req = req.header("Authorization", format!("Bearer {}", key));
         }
-        match req.send().await {
-            Ok(r) if r.status().is_success() => return true,
-            _ => {
-                warn!(
-                    "health probe {} failed (timeout {}s), {}",
-                    health_url,
-                    timeout_secs,
-                    if timeout_secs == 2 {
-                        "retrying once before declaring the server dead"
-                    } else {
-                        "server considered dead"
-                    }
-                );
+        let healthy = match req.send().await {
+            Ok(r) => {
+                let status = r.status().as_u16();
+                r.json::<serde_json::Value>()
+                    .await
+                    .map(|payload| {
+                        screenpipe_engine::health_identity::is_screenpipe_health_response(
+                            status, &payload,
+                        )
+                    })
+                    .unwrap_or(false)
             }
+            Err(_) => false,
+        };
+        if healthy {
+            return true;
         }
+        warn!(
+            "health probe {} failed identity check (timeout {}s), {}",
+            health_url,
+            timeout_secs,
+            if timeout_secs == 2 {
+                "retrying once before declaring the server dead"
+            } else {
+                "server considered dead"
+            }
+        );
     }
     false
 }
@@ -709,7 +721,9 @@ pub async fn start_capture(
     let (port, api_key) = {
         let server_guard = state.server.lock().await;
         let Some(ref core) = *server_guard else {
-            return Err("Server not running — cannot start capture".to_string());
+            warn!("Server not running — requesting full restart");
+            let _ = app.emit("request-server-restart", ());
+            return Err("Server not running — full restart requested".to_string());
         };
         (core.port, core.local_api_key.clone())
     };
