@@ -66,6 +66,7 @@ mod deep_link;
 mod dev_isolation;
 mod diagnostic_logs;
 mod disk_usage;
+mod storage_migration;
 mod disk_pressure_notifications;
 #[cfg(feature = "e2e")]
 mod e2e;
@@ -133,9 +134,15 @@ mod tray;
 mod staged_update;
 mod stale_tier;
 mod startup_auth;
+mod update_restart;
 mod updates;
 mod voice_training;
 mod window;
+// Reuse the workflow engine from the parent PR; recorder ownership stays here.
+#[path = "../../../screenpipe-workflows-tauri/src-tauri/src/workflows_runtime.rs"]
+mod workflows_runtime;
+#[path = "../../../screenpipe-workflows-tauri/src-tauri/src/workflows_media.rs"]
+mod workflows_media;
 mod windows_ca_bundle;
 #[cfg(target_os = "windows")]
 mod windows_crash_dump;
@@ -190,6 +197,7 @@ mod notifications;
 mod safe_icon;
 mod shortcuts;
 mod skills;
+mod grokbot;
 // Binding generation runs from `cargo test` (`bun run bindings:generate` /
 // `bindings:check`) and from the debug-build refresh in `async_main`. Release
 // binaries never export TypeScript, so the whole module stays out of them.
@@ -470,9 +478,9 @@ async fn main() {
 
     // Point debug builds at their own data dir and ports so `bun tauri dev`
     // can't hand off to (or kill) an installed production app. Must run before
-    // the DB-recovery-lock check, the /focus single-instance handoff and the
-    // telemetry store read below — all of which resolve the data directory or
-    // the focus port. No-op in release builds. See `dev_isolation`.
+    // the /focus single-instance handoff and telemetry store read below, which
+    // resolve the data directory or focus port. No-op in release builds.
+    // See `dev_isolation`.
     dev_isolation::apply();
 
     #[cfg(target_os = "linux")]
@@ -491,45 +499,6 @@ async fn main() {
 
     #[cfg(target_os = "windows")]
     windows_webview_env::install_user_data_dir();
-
-    // Refuse to launch while a `screenpipe db recover|cleanup` operation is in
-    // progress. The CLI writes ~/.screenpipe/.db_recovery.lock before doing
-    // anything destructive; if the user double-clicks the app icon mid-recovery,
-    // we'd otherwise race the swap and corrupt the DB again. The CLI heartbeats
-    // the lock every 30 s, so a fresh mtime means the op is genuinely live.
-    //
-    // Escape hatches (in order of preference):
-    //   1. `screenpipe db unlock` — friendly path
-    //   2. SCREENPIPE_IGNORE_DB_LOCK=1 env var — bypass on this launch only
-    //   3. `rm ~/.screenpipe/.db_recovery.lock` — manual
-    //
-    // See `crates/screenpipe-engine/src/cli/db.rs`.
-    if std::env::var("SCREENPIPE_IGNORE_DB_LOCK").ok().as_deref() != Some("1") {
-        let lock_path =
-            screenpipe_core::paths::default_screenpipe_data_dir().join(".db_recovery.lock");
-        if let Ok(metadata) = std::fs::metadata(&lock_path) {
-            let stale = metadata
-                .modified()
-                .ok()
-                .and_then(|m| m.elapsed().ok())
-                .map(|d| d.as_secs() > 3600)
-                .unwrap_or(false);
-            if stale {
-                let _ = std::fs::remove_file(&lock_path);
-            } else {
-                let body = std::fs::read_to_string(&lock_path).unwrap_or_default();
-                eprintln!(
-                    "screenpipe: a `screenpipe db ...` operation is in progress.\n\
-                     lock: {}\n\
-                     content: {}\n\
-                     options:\n  • wait for the op to finish, then re-open the app\n  • run `screenpipe db unlock` if you're sure it's stuck\n  • set SCREENPIPE_IGNORE_DB_LOCK=1 and retry to bypass this check",
-                    lock_path.display(),
-                    body.trim(),
-                );
-                std::process::exit(2);
-            }
-        }
-    }
 
     // Export the Windows root/CA cert stores to a PEM file and set
     // NODE_EXTRA_CA_CERTS before any bun/node subprocess can spawn. Fixes
@@ -932,7 +901,7 @@ async fn main() {
     // #[tokio::main] and panics ("Cannot start a runtime from within a
     // runtime"), killing the app at launch.
     let initial_cloud_token = crate::auth_token::migrate_plaintext_token(
-        &screenpipe_core::paths::default_screenpipe_data_dir(),
+        crate::config::app_data_dir(),
     )
     .await;
 
@@ -944,6 +913,7 @@ async fn main() {
         is_starting_capture: Arc::new(AtomicBool::new(false)),
         last_spawn_epoch: Arc::new(AtomicU64::new(0)),
         wants_recording: Arc::new(AtomicBool::new(false)),
+        deferred_account_start: Default::default(),
         interrupted_meeting: Arc::new(tokio::sync::Mutex::new(None)),
         cloud_token: Arc::new(arc_swap::ArcSwap::new(Arc::new(initial_cloud_token))),
         history_access: screenpipe_engine::history_access::HistoryAccessPolicy::unrestricted(),
@@ -1162,6 +1132,7 @@ async fn main() {
     let sync_scheduler = screenpipe_connect::sync_scheduler::SyncScheduler::new();
 
     let app = app.manage(recording_state)
+        .manage(storage_migration::StorageMigrationState::default())
         .manage(activity_history::ActivityHistoryState::default())
         .manage(first_run_summary::FirstRunSummaryState::default())
         .manage(disk_pressure_notifications::DiskPressureNotificationState::default())
@@ -1231,7 +1202,9 @@ async fn main() {
                 }
                 if !app_ui_hidden {
                     app_submenu_builder = app_submenu_builder
-                        .item(&MenuItemBuilder::with_id("settings", "Settings...")
+                        // Tauri menu listeners are global, including tray menus.
+                        // Keep this id distinct so Settings opens exactly once.
+                        .item(&MenuItemBuilder::with_id("app_settings", "Settings...")
                             .accelerator("CmdOrCtrl+,")
                             .build(app)?)
                         .separator();
@@ -1279,7 +1252,7 @@ async fn main() {
                 app.set_menu(menu)?;
                 app.on_menu_event(|app_handle, event| {
                     match event.id().as_ref() {
-                        "settings" => {
+                        "app_settings" => {
                             // Defer off event stack (same as tray: runs from tao::send_event).
                             let app_for_closure = app_handle.clone();
                             let _ = app_handle.run_on_main_thread(move || {
@@ -1416,7 +1389,6 @@ async fn main() {
             // an empty plugin handle and save defaults over the ciphertext.
             // Note: StoreBuilder handles file creation internally — pre-creating
             // store.bin here caused TOCTOU race conditions ("File exists" os error 17).
-            #[allow(unused_mut)] // E2E seeds mutate the store in feature builds.
             let mut store = store::init_store(&app.handle()).map_err(|e| {
                 error!("Failed to init settings store; aborting startup: {}", e);
                 // A log line is invisible to the user: without this the app just
@@ -1432,15 +1404,14 @@ async fn main() {
             #[cfg(feature = "e2e")]
             e2e::seeds::apply_settings(app.handle(), &mut store);
 
-            app.manage(store.clone());
-
             // Resolve authentication at the first point its settings
             // prerequisite is available, before beginning any application
             // runtime. Consumer and Enterprise builds deliberately share these
             // two sequential steps; only the credential check inside the
             // resolver varies by build. `SCREENPIPE_SKIP_ONBOARDING` returns
             // `NotRequired` without invoking either checker.
-            startup_auth::bootstrap(&app_handle, &store);
+            startup_auth::bootstrap(&app_handle, &mut store);
+            app.manage(store.clone());
 
             crate::recording::refresh_history_access_policy(
                 &app.state::<RecordingState>().history_access,
@@ -1454,7 +1425,17 @@ async fn main() {
             }
 
             // Resolve data directory from user setting (custom dir or ~/.screenpipe)
-            let (data_dir, data_dir_fell_back) = config::resolve_data_dir(&store.data_dir)?;
+            let selected_data_dir = config::selected_recording_data_dir(&store.data_dir)?;
+            crate::db_relaunch::set_active_database(&selected_data_dir);
+            let data_dir = match config::resolve_data_dir(&store.data_dir) {
+                Ok(path) => path,
+                Err(error) => {
+                    let message = format!("Failed to initialize database: cannot access recording data directory: {error}");
+                    warn!("{message}; keeping the UI available while recording retries");
+                    crate::health::set_boot_error(&message);
+                    selected_data_dir
+                }
+            };
             info!("Recording data directory: {}", data_dir.display());
 
             // Pin SCREENPIPE_DATA_DIR to the *resolved* dir so every consumer of
@@ -1470,6 +1451,8 @@ async fn main() {
             // can fire) makes `default_screenpipe_data_dir()` self-consistent and
             // also propagates the correct dir to child processes (the CLI
             // sidecar inherits this env).
+            // App settings and the cloud session stay in app_data_dir(), pinned
+            // before authentication, so webviews cannot open a second store.
             std::env::set_var("SCREENPIPE_DATA_DIR", &data_dir);
 
             // The fs-plugin scope in capabilities/main.json only whitelists
@@ -1503,15 +1486,6 @@ async fn main() {
             // PostHog without sending the raw license key. No-op on consumer
             // builds; explicit MDM/support env vars still win when provided.
             enterprise_sync::configure_telemetry_context(&app_handle);
-
-            if data_dir_fell_back {
-                let app_handle_fb = app_handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    // Small delay so the frontend window is ready to receive events
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    let _ = app_handle_fb.emit("data-dir-fallback", ());
-                });
-            }
 
             // Attach non-sensitive settings to all future Sentry events
             if !telemetry_disabled {
@@ -1692,6 +1666,7 @@ async fn main() {
             if !app_ui_hidden {
                 let local_api = recording::local_api_context_from_app(&app.handle());
                 skills::connect_detected_ai_tools_in_background(
+                    app.handle().clone(),
                     store.recording.api_auth,
                     local_api.port,
                 );
@@ -1856,34 +1831,22 @@ async fn main() {
             //     let _ = app_handle.emit("vault-locked-on-startup", ());
             // }
 
-            let launch_db_path = data_dir.join("db.sqlite");
-            let launch_db_quarantined = screenpipe_db::sqlite_quarantine_exists(&launch_db_path);
-            if launch_db_quarantined {
-                // Preserve the cross-launch fail-closed boundary before any
-                // server, SQLite pool, watchdog, or capture thread is started.
-                crate::health::set_boot_error(
-                    "database remains quarantined after a SQLite hard fault; run `screenpipe db recover` while screenpipe is closed",
-                );
-                crate::health::set_recording_status(crate::health::RecordingStatus::Error);
-            }
-
             // Start server core + capture on a dedicated thread with its own tokio runtime
             // to avoid competing with Tauri's UI runtime.
             // Two-phase startup: ServerCore (DB + HTTP + pipes) then CaptureSession (vision + audio).
             'start_server: {
-                if launch_db_quarantined {
-                    info!(
-                        database = %launch_db_path.display(),
-                        "Skipping server and capture startup: durable SQLite quarantine is active"
-                    );
-                    break 'start_server;
-                }
                 let store_clone = store.clone();
                 let data_dir_clone = data_dir.clone();
                 if !crate::recording::server_access_allowed(&app_handle, &store_clone) {
+                    app_handle
+                        .state::<RecordingState>()
+                        .deferred_account_start
+                        .defer();
                     info!("Skipping server auto-start: screenpipe account access required");
                     crate::health::set_recording_status(crate::health::RecordingStatus::Paused);
                     let _ = app_handle.emit("app-entitlement-required", ());
+                    // A webview may already have refreshed the startup snapshot.
+                    crate::recording::resume_deferred_account_start(app_handle.clone());
                     break 'start_server;
                 }
                 let recording_state = app_handle.state::<RecordingState>();
@@ -2066,6 +2029,19 @@ async fn main() {
 
                             crate::recording::notify_audio_engine_fallback(&store_clone);
 
+                            let resumed_migration = match crate::storage_migration::resume_before_startup(
+                                &app_for_owned,
+                                &app_for_owned.state::<recording::RecordingState>(),
+                            ).await {
+                                Ok(resumed) => resumed,
+                                Err(error) => {
+                                    crate::health::set_boot_error(&error);
+                                    crate::health::set_recording_status(crate::health::RecordingStatus::Error);
+                                    is_starting_clone.store(false, std::sync::atomic::Ordering::SeqCst);
+                                    return;
+                                }
+                            };
+
                             info!("Starting server core + capture on dedicated runtime...");
 
                             // Owned-browser: create the connect-side instance now so the
@@ -2093,17 +2069,21 @@ async fn main() {
                                 Some(owned_browser),
                                 cloud_token_arc.clone(),
                                 history_access.clone(),
+                                app_for_owned.path().app_local_data_dir().ok().map(|dir| dir.join("workflows")),
                             )
                             .await
                             {
                                 Ok(s) => s,
                                 Err(e) => {
                                     error!("Failed to start server core: {}", e);
+                                    if let Some(resumed) = resumed_migration {
+                                        let _ = crate::storage_migration::finish_startup(
+                                            &app_for_owned, resumed, Err(e.to_string()),
+                                        ).await;
+                                    }
+                                    crate::db_relaunch::note_respawn_failure(&app_for_db_wedge, &e).await;
                                     if crate::port_conflict::is_error(&e, config.port) {
-                                        crate::port_conflict::show_reclaim_failed(
-                                            &app_for_owned,
-                                            config.port,
-                                        );
+                                        crate::port_conflict::show_reclaim_failed(&app_for_owned, config.port);
                                     }
                                     is_starting_clone.store(false, std::sync::atomic::Ordering::SeqCst);
                                     return;
@@ -2161,6 +2141,17 @@ async fn main() {
                                 info!("Server started without capture");
                             }
                             drop(capture_guard);
+                            if let Some(resumed) = resumed_migration {
+                                if let Err(error) = crate::storage_migration::finish_startup(
+                                    &app_for_owned, resumed, Ok(()),
+                                ).await {
+                                    error!("Could not finish migration startup: {error}");
+                                }
+                            } else if let Err(error) = crate::storage_migration::finish_recording_recovery(
+                                &app_for_owned,
+                            ).await {
+                                error!("Could not finish recording recovery: {error}");
+                            }
                             is_starting_clone
                                 .store(false, std::sync::atomic::Ordering::SeqCst);
                             drop(lifecycle_guard);
@@ -2318,50 +2309,6 @@ async fn main() {
             crate::meeting_live_notes::start(app_handle.clone());
             crate::meeting_stall_notifications::start(app_handle.clone());
             crate::db_recovery_notifications::start(app_handle.clone());
-            if launch_db_quarantined {
-                // A new process must preserve the same fail-closed state as the
-                // process that observed the hard fault — unless its exact
-                // prerequisite has cleared (fresh process for SHORT_READ,
-                // recovered volume headroom for FULL) and this unchanged
-                // generation verifies healthy. Verification runs off the setup
-                // thread: it reads the whole file, which is seconds on a large
-                // database, and the UI must not wait for it.
-                let self_heal_app = app_handle.clone();
-                let self_heal_db_path = launch_db_path.clone();
-                let notify_data_dir = data_dir.clone();
-                let recovery_app = app_handle.clone();
-                let automatic_recovery = headless_startup;
-                tauri::async_runtime::spawn(async move {
-                    if crate::db_self_heal::try_self_heal_at_launch(
-                        self_heal_app,
-                        self_heal_db_path,
-                        !automatic_recovery,
-                    )
-                    .await
-                    {
-                        return;
-                    }
-                    crate::db_relaunch::surface_quarantined_recovery_at_launch(
-                        &launch_db_path,
-                        !automatic_recovery,
-                    )
-                    .await;
-                    if automatic_recovery {
-                        let recovery = crate::db_recovery_notifications::
-                            start_headless_quarantined_database_recovery(
-                                recovery_app,
-                                notify_data_dir,
-                            );
-                        if let Err(error) = recovery {
-                            error!("failed to start automatic protected database recovery: {error}");
-                        }
-                    } else {
-                        crate::db_recovery_notifications::notify_quarantined_database(
-                            notify_data_dir,
-                        );
-                    }
-                });
-            }
             crate::disk_pressure_notifications::start(app_handle.clone());
             activity_history::start(app_handle.clone());
             first_run_summary::start(app_handle.clone());

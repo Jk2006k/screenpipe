@@ -5,6 +5,7 @@
 import { homeDir } from "@tauri-apps/api/path";
 import { getVersion } from "@tauri-apps/api/app";
 import { commands } from "@/lib/utils/tauri";
+import { saveWithPresetReassignment } from "@/lib/ai-preset-deletion";
 import { platform } from "@tauri-apps/plugin-os";
 import { Store } from "@tauri-apps/plugin-store";
 import { emit, listen } from "@tauri-apps/api/event";
@@ -47,6 +48,7 @@ import {
 } from "@/lib/live-views/onboarding-activation";
 import {
 	cloneLocalDesktopRemotePolicy,
+	LOCAL_DESKTOP_REMOTE_POLICY,
 	NEW_INSTALL_REMOTE_CONTROL_PREFERENCES,
 	normalizeDesktopRemotePolicySnapshot,
 	normalizeDesktopRemotePreferences,
@@ -712,7 +714,8 @@ let DEFAULT_SETTINGS: Settings = {
 			activitiesIntervalMinutes: 15,
 			aiPresets: makeDefaultPresets(false) as any,
 			userGoalCategory: DEFAULT_USER_GOAL_CATEGORY,
-			deviceId: crypto.randomUUID(),
+			// Native startup persists the device identity before opening a webview.
+			deviceId: "",
 			deepgramApiKey: "",
 			isLoading: false,
 			userId: "",
@@ -835,7 +838,7 @@ let DEFAULT_SETTINGS: Settings = {
 			keepComputerAwake: false,
 			showRestartNotifications: false,
 			experimentalCoreaudioSystemAudio: true,
-			experimentalMeetingPiggyback: false,
+			experimentalMeetingPiggyback: LOCAL_DESKTOP_REMOTE_POLICY.boolean.smartRecording.defaultEnabled,
 			alwaysRecordBluetoothMic: false,
 			windowsInputAecEnabled: false,
 			macosInputVpioEnabled: false,
@@ -962,9 +965,9 @@ export const getStore = async () => {
 	if (!_store) {
 		_store = (async () => {
 			// Resolve the base dir via the backend so the webview opens the same
-			// store.bin as Rust (get_base_dir honors SCREENPIPE_DATA_DIR); a
-			// hardcoded ~/.screenpipe here splits the settings store in two
-			// whenever that override is set.
+			// store.bin as Rust. The backend pins this to the launch directory,
+			// even when recordings use another folder or SCREENPIPE_DATA_DIR
+			// was supplied to isolate the entire app at launch.
 			let baseDir: string | null = null;
 			try {
 				const res = await commands.getScreenpipeBaseDir();
@@ -1440,8 +1443,10 @@ function createSettingsStore() {
 			) as Settings;
 			if (managedValues) newSettings.enterpriseManagedSettings = managedValues;
 			else delete newSettings.enterpriseManagedSettings;
-			await setSettingsStripped(store, newSettings);
-			await saveAndEncrypt(store);
+			await saveWithPresetReassignment(current, newSettings, async (reassigned) => {
+				await setSettingsStripped(store, reassigned);
+				await saveAndEncrypt(store);
+			});
 		});
 
 	const reset = () =>
@@ -1450,7 +1455,7 @@ function createSettingsStore() {
 			const current = await get();
 			const managedValues = await activeManagedValues(current);
 			const defaults = applyManagedOverrides(
-				createDefaultSettingsObject() as Record<string, unknown>,
+				{ ...createDefaultSettingsObject(), deviceId: current.deviceId } as Record<string, unknown>,
 				managedValues
 			) as Settings;
 			if (managedValues) defaults.enterpriseManagedSettings = managedValues;
@@ -1459,6 +1464,7 @@ function createSettingsStore() {
 		});
 
 	const resetSetting = async <K extends keyof Settings>(key: K) => {
+		if (key === "deviceId") return;
 		const current = await get();
 		const defaultValue = createDefaultSettingsObject()[key];
 		await set({ [key]: defaultValue } as Partial<Settings>);

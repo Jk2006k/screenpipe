@@ -35,7 +35,7 @@ export default function PlanSelectionStep({
   const { settings, loadUser } = useSettings();
   const user = settings.user as AppUser | null | undefined;
   const [returnStatus] = useState(checkoutStatus);
-  const [busy, setBusy] = useState(returnStatus === "complete");
+  const [busy, setBusy] = useState(returnStatus !== "cancelled");
   const [error, setError] = useState<string | null>(null);
   const [returnRecoveryFinished, setReturnRecoveryFinished] = useState(
     returnStatus !== "complete",
@@ -55,7 +55,7 @@ export default function PlanSelectionStep({
     if (submissionStartedRef.current) return;
     if (!userToken) {
       setBusy(false);
-      setError("sign in to continue");
+      setError("Sign in to continue");
       return;
     }
 
@@ -77,10 +77,15 @@ export default function PlanSelectionStep({
       setError(
         checkoutError instanceof Error
           ? checkoutError.message
-          : "secure checkout could not be opened",
+          : "Secure checkout could not be opened",
       );
     }
   }, [userToken]);
+
+  useEffect(() => {
+    if (returnStatus !== null) return;
+    startCheckout();
+  }, [returnStatus, startCheckout]);
 
   useEffect(() => {
     if (returnStatus !== "complete") return;
@@ -98,7 +103,7 @@ export default function PlanSelectionStep({
     ) {
       if (returnStatus === "complete" && !userToken) {
         setBusy(false);
-        setError("sign in to confirm your payment");
+        setError("Sign in to confirm your payment");
       }
       return;
     }
@@ -141,7 +146,7 @@ export default function PlanSelectionStep({
       if (pollAttemptsRef.current >= CHECKOUT_MAX_POLL_ATTEMPTS) {
         setConfirmationTimedOut(true);
         setBusy(false);
-        setError("account confirmation is taking longer than expected");
+        setError("Account confirmation is taking longer than expected");
         posthog.capture("onboarding_card_checkout_confirmation_timed_out", {
           poll_attempts: pollAttemptsRef.current,
         });
@@ -199,16 +204,6 @@ export default function PlanSelectionStep({
     setRecoveryAttempt((attempt) => attempt + 1);
   }, [userToken]);
 
-  const continueWithFree = useCallback(() => {
-    if (advancedRef.current) return;
-    advancedRef.current = true;
-    posthog.capture("onboarding_plan_activated", {
-      plan: "free",
-      confirmation: "free_no_card",
-    });
-    void handleNextSlide();
-  }, [handleNextSlide]);
-
   if (returnStatus === "complete") {
     return (
       <div
@@ -216,11 +211,11 @@ export default function PlanSelectionStep({
         data-testid="onboarding-card-capture"
       >
         <div className="text-center">
-          <h2 className="text-xl font-semibold lowercase">
-            confirming your payment
+          <h2 className="text-xl font-semibold normal-case">
+            Confirming your payment
           </h2>
           <p className="mt-2 font-mono text-[10px] leading-relaxed text-muted-foreground">
-            setup continues automatically when your account is ready.
+            Setup continues automatically when your account is ready.
           </p>
         </div>
         <div className="mt-5 flex min-h-[150px] items-center justify-center border p-6 text-center">
@@ -231,15 +226,15 @@ export default function PlanSelectionStep({
                 <button
                   type="button"
                   onClick={retryConfirmation}
-                  className="mt-4 border px-4 py-2 font-mono text-[10px] uppercase tracking-widest transition-colors hover:bg-foreground hover:text-background"
+                  className="mt-4 border px-4 py-2 font-mono text-[10px] normal-case tracking-widest transition-colors hover:bg-foreground hover:text-background"
                 >
-                  retry confirmation
+                  Retry confirmation
                 </button>
               )}
             </div>
           ) : (
             <p className="font-mono text-[11px] text-muted-foreground">
-              {busy ? "checking secure checkout" : "waiting for confirmation"}
+              {busy ? "Checking secure checkout" : "Waiting for confirmation"}
             </p>
           )}
         </div>
@@ -253,33 +248,23 @@ export default function PlanSelectionStep({
         className="mx-auto w-full max-w-sm text-center"
         data-testid="onboarding-card-capture"
       >
-        <h2 className="text-xl font-semibold lowercase">
-          checkout was not completed
+        <h2 className="text-xl font-semibold normal-case">
+          Checkout was not completed
         </h2>
         <p className="mt-2 font-mono text-[10px] leading-relaxed text-muted-foreground">
-          start the Business trial, or keep using Free without a card.
+          Retry when you are ready to start your trial.
         </p>
         {error && (
           <p className="mt-4 font-mono text-[11px] text-destructive">{error}</p>
         )}
-        <div className="mt-5 flex flex-col gap-3">
-          <button
-            type="button"
-            onClick={startCheckout}
-            disabled={busy}
-            className="border bg-foreground px-4 py-2 font-mono text-[10px] uppercase tracking-widest text-background transition-opacity hover:opacity-80 disabled:opacity-50"
-          >
-            {busy ? "opening checkout" : "retry secure checkout"}
-          </button>
-          <button
-            type="button"
-            data-testid="onboarding-plan-free"
-            onClick={continueWithFree}
-            className="border px-4 py-2 font-mono text-[10px] uppercase tracking-widest transition-colors hover:bg-foreground hover:text-background"
-          >
-            continue with Free — no card
-          </button>
-        </div>
+        <button
+          type="button"
+          onClick={startCheckout}
+          disabled={busy}
+          className="mt-5 border bg-foreground px-4 py-2 font-mono text-[10px] normal-case tracking-widest text-background transition-opacity hover:opacity-80 disabled:opacity-50"
+        >
+          {busy ? "Opening checkout" : "Retry secure checkout"}
+        </button>
       </div>
     );
   }
@@ -287,31 +272,23 @@ export default function PlanSelectionStep({
   return (
     <div
       className="mx-auto w-full max-w-sm text-center"
-      data-testid="onboarding-plan-selection"
+      data-testid="onboarding-card-capture"
     >
-      <h2 className="text-xl font-semibold lowercase">choose how to start</h2>
-      <p className="mt-3 font-mono text-[11px] leading-relaxed text-muted-foreground">
-        Use Screenpipe Free without a card, or start a 7-day Business trial.
+      <h2 className="text-xl font-semibold normal-case">
+        Opening secure checkout
+      </h2>
+      <p className="mt-3 font-mono text-[11px] text-muted-foreground">
+        {error || "Loading screenpipe.com"}
       </p>
-      {error && <p className="mt-3 font-mono text-[11px] text-destructive">{error}</p>}
-      <div className="mt-5 flex flex-col gap-3">
+      {error && (
         <button
           type="button"
           onClick={startCheckout}
-          disabled={busy}
-          className="border bg-foreground px-4 py-2 font-mono text-[10px] uppercase tracking-widest text-background transition-opacity hover:opacity-80 disabled:opacity-50"
+          className="mt-5 border px-4 py-2 font-mono text-[10px] normal-case tracking-widest transition-colors hover:bg-foreground hover:text-background"
         >
-          {busy ? "opening checkout" : "start 7-day Business trial"}
+          Try again
         </button>
-        <button
-          type="button"
-          data-testid="onboarding-plan-free"
-          onClick={continueWithFree}
-          className="border px-4 py-2 font-mono text-[10px] uppercase tracking-widest transition-colors hover:bg-foreground hover:text-background"
-        >
-          continue with Free — no card
-        </button>
-      </div>
+      )}
     </div>
   );
 }

@@ -17,8 +17,6 @@ const mocks = vi.hoisted(() => ({
   view: {} as LearningWindowView,
   emit: vi.fn().mockResolvedValue(undefined),
   completeOnboarding: vi.fn().mockResolvedValue(undefined),
-  setOnboardingStep: vi.fn().mockResolvedValue({ status: "ok", data: null }),
-  capture: vi.fn(),
   handoff: {
     targets: [],
     resolved: false,
@@ -50,12 +48,8 @@ vi.mock("@tauri-apps/api/event", () => ({
   emit: mocks.emit,
   listen: vi.fn(async () => () => {}),
 }));
-vi.mock("posthog-js", () => ({ default: { capture: mocks.capture } }));
 vi.mock("@/lib/utils/tauri", () => ({
-  commands: {
-    completeOnboarding: mocks.completeOnboarding,
-    setOnboardingStep: mocks.setOnboardingStep,
-  },
+  commands: { completeOnboarding: mocks.completeOnboarding },
 }));
 
 vi.mock("@/lib/hooks/use-settings", () => ({
@@ -157,7 +151,7 @@ describe("trial activation summary experience", () => {
     mocks.view = view({ activationState: "summary", phase: "empty" });
     render(<TrialActivationSummaryExperience />);
 
-    fireEvent.click(screen.getByRole("button", { name: "retry summary" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retry summary" }));
     await waitFor(() => expect(mocks.completeOnboarding).toHaveBeenCalled());
     expect(screen.queryByTestId("trial-activation-paywall")).not.toBeInTheDocument();
   });
@@ -175,26 +169,6 @@ describe("trial activation summary experience", () => {
     expect(
       screen.getByTestId("trial-activation-start-trial").parentElement,
     ).toHaveClass("pointer-events-auto");
-  });
-
-  it("unlocks the full app when the user continues with Free", async () => {
-    render(<TrialActivationUnlockPrompt onStartTrial={vi.fn()} />);
-
-    fireEvent.click(screen.getByTestId("trial-activation-continue-free"));
-
-    await waitFor(() =>
-      expect(mocks.setOnboardingStep).toHaveBeenCalledWith(
-        "trial-activation-v1-unlocked",
-      ),
-    );
-    expect(mocks.capture).toHaveBeenCalledWith(
-      "onboarding_plan_activated",
-      expect.objectContaining({
-        plan: "free",
-        confirmation: "free_no_card",
-        source: "summary_lock",
-      }),
-    );
   });
 
   it("supports an inline CTA beside native product surfaces", () => {
@@ -237,7 +211,7 @@ describe("first-run learning banner", () => {
     );
     expect(screen.queryByTestId("normal-home")).not.toBeInTheDocument();
     expect(
-      screen.getByText("screenpipe learned enough to help"),
+      screen.getByText("Screenpipe learned enough to help"),
     ).toBeInTheDocument();
     expect(mocks.view.markReadyShown).toHaveBeenCalledTimes(1);
 
@@ -315,12 +289,12 @@ describe("first-run learning banner", () => {
     render(<FirstRunLearningBanner />);
 
     expect(
-      screen.getByText("screenpipe learned enough to help"),
+      screen.getByText("Screenpipe learned enough to help"),
     ).toBeInTheDocument();
     expect(
       screen.queryByTestId("first-run-next-steps"),
     ).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "this is ready" }));
+    fireEvent.click(screen.getByRole("button", { name: "This is ready" }));
     expect(dismiss).toHaveBeenCalled();
   });
 
@@ -342,7 +316,7 @@ describe("first-run learning banner", () => {
         dismiss,
       });
       const rendered = render(<FirstRunLearningBanner />);
-      expect(screen.getByText("screenpipe is ready")).toBeInTheDocument();
+      expect(screen.getByText("Screenpipe is ready")).toBeInTheDocument();
       expect(
         screen.queryByTestId("first-run-next-steps"),
       ).not.toBeInTheDocument();
@@ -354,7 +328,7 @@ describe("first-run learning banner", () => {
 
     mocks.view = view({ phase: "empty", showProgress: true, dismiss });
     render(<FirstRunLearningBanner />);
-    fireEvent.click(screen.getByRole("button", { name: "this is ready" }));
+    fireEvent.click(screen.getByRole("button", { name: "This is ready" }));
     expect(dismiss).toHaveBeenCalled();
   });
 

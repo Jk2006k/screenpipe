@@ -20,6 +20,9 @@ const mocks = vi.hoisted(() => ({
   showWindow: vi.fn(async () => undefined),
   applyEnterpriseUiVisibility: vi.fn(async () => false),
   completeOnboarding: vi.fn(async () => undefined),
+  saveProductMode: vi.fn().mockResolvedValue(undefined),
+  loadWorkProfile: vi.fn().mockResolvedValue(null),
+  saveWorkProfile: vi.fn().mockResolvedValue(undefined),
   routerReplace: vi.fn(),
   capture: vi.fn(),
   useRealLoginGate: false,
@@ -62,6 +65,11 @@ const onboardingData = {
   isCompleted: false,
   trialActivationFreshInstall: false,
 };
+
+vi.mock("@/lib/workflows/entry-preference", () => ({ saveProductMode: mocks.saveProductMode }));
+vi.mock("@/lib/workflows/desktop-platform", () => ({ desktopWorkflowsPlatform: {
+  loadWorkProfile: mocks.loadWorkProfile, saveWorkProfile: mocks.saveWorkProfile,
+} }));
 
 vi.mock("@/components/ui/use-toast", () => ({
   useToast: () => ({ toast: vi.fn() }),
@@ -197,6 +205,7 @@ vi.mock("posthog-js", () => ({
 }));
 
 import OnboardingPage from "./page";
+import { StartupAuthenticationContext } from "@/components/app-entitlement-gate";
 import {
   TRIAL_ACTIVATION_ASSIGNMENT_SESSION_KEY,
   TRIAL_ACTIVATION_CHECKOUT_STATE_KEY,
@@ -232,6 +241,24 @@ describe("enterprise onboarding authentication", () => {
     mocks.settings.deviceTier = "low";
     mocks.settings.user = null;
     mocks.isSettingsLoaded = true;
+  });
+
+  it("resumes the first-task choice and saves a workflow goal without duplicating a prior save", async () => {
+    mocks.enterprisePolicy.isManagedDeployment = false;
+    onboardingData.currentStep = "first-task";
+    mocks.loadWorkProfile.mockResolvedValueOnce({
+      priorities: "Customer follow-ups", summary: "Customer support",
+    });
+    render(<OnboardingPage />);
+    fireEvent.click(await screen.findByRole("button", { name: /Understand a workflow/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Customer follow-ups" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Workflows" }));
+    await waitFor(() => expect(mocks.completeOnboarding).toHaveBeenCalledWith({ method: "setup_finished" }));
+    expect(mocks.saveProductMode).toHaveBeenCalledWith("workflows");
+    expect(mocks.saveWorkProfile).toHaveBeenCalledWith(expect.objectContaining({
+      priorities: "Customer follow-ups", summary: "Customer support",
+    }));
+    expect(screen.queryByText("regular sign in")).not.toBeInTheDocument();
   });
 
   it("offers regular sign-in and Enterprise Key on the login step", () => {
@@ -472,6 +499,7 @@ describe("enterprise onboarding authentication", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "finish recommended setup" }),
     );
+    fireEvent.click(await screen.findByRole("button", { name: /Find something/ }));
     await waitFor(() =>
       expect(mocks.completeOnboarding).toHaveBeenCalledWith({
         method: "setup_finished",
@@ -788,6 +816,7 @@ describe("enterprise onboarding authentication", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "finish recommended setup" }),
     );
+    fireEvent.click(await screen.findByRole("button", { name: /Find something/ }));
 
     await waitFor(() => expect(mocks.completeOnboarding).toHaveBeenCalled());
     expect(mocks.setOnboardingStep).not.toHaveBeenCalledWith(
@@ -814,6 +843,7 @@ describe("enterprise onboarding authentication", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "finish recommended setup" }),
     );
+    fireEvent.click(await screen.findByRole("button", { name: /Find something/ }));
 
     await waitFor(() =>
       expect(mocks.completeOnboarding).toHaveBeenCalledWith({
@@ -849,12 +879,43 @@ describe("enterprise onboarding authentication", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "finish recommended setup" }),
     );
+    fireEvent.click(await screen.findByRole("button", { name: /Find something/ }));
     await waitFor(() =>
       expect(mocks.completeOnboarding).toHaveBeenCalledWith({
         method: "setup_finished",
       }),
     );
     expect(screen.queryByText("plan selection")).not.toBeInTheDocument();
+  });
+
+  it("returns a signed-out consumer with a persisted engine step to login", async () => {
+    mocks.enterprisePolicy.isManagedDeployment = false;
+    mocks.settings.user = null;
+    onboardingData.currentStep = "engine";
+
+    render(
+      <StartupAuthenticationContext.Provider value="logged_out">
+        <OnboardingPage />
+      </StartupAuthenticationContext.Provider>,
+    );
+
+    expect(await screen.findByText("regular sign in")).toBeInTheDocument();
+    expect(screen.queryByText("engine")).not.toBeInTheDocument();
+  });
+
+  it("restores an authenticated consumer after a logged-out startup", async () => {
+    mocks.enterprisePolicy.isManagedDeployment = false;
+    mocks.settings.user = { token: "tok" };
+    onboardingData.currentStep = "engine";
+
+    render(
+      <StartupAuthenticationContext.Provider value="logged_out">
+        <OnboardingPage />
+      </StartupAuthenticationContext.Provider>,
+    );
+
+    expect(await screen.findByText("engine")).toBeInTheDocument();
+    expect(screen.queryByText("regular sign in")).not.toBeInTheDocument();
   });
 
   it("does not restore managed onboarding onto consumer pricing", async () => {
@@ -915,6 +976,7 @@ describe("enterprise onboarding authentication", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "finish recommended setup" }),
     );
+    fireEvent.click(await screen.findByRole("button", { name: /Find something/ }));
     await waitFor(() =>
       expect(mocks.completeOnboarding).toHaveBeenCalledWith({
         method: "setup_finished",
@@ -945,6 +1007,7 @@ describe("enterprise onboarding authentication", () => {
       fireEvent.click(
         screen.getByRole("button", { name: "finish recommended setup" }),
       );
+    fireEvent.click(await screen.findByRole("button", { name: /Find something/ }));
       await waitFor(() =>
         expect(mocks.completeOnboarding).toHaveBeenCalledWith({
           method: "setup_finished",
@@ -975,6 +1038,7 @@ describe("enterprise onboarding authentication", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "finish recommended setup" }),
     );
+    fireEvent.click(await screen.findByRole("button", { name: /Find something/ }));
     await waitFor(() =>
       expect(mocks.completeOnboarding).toHaveBeenCalledWith({
         method: "setup_finished",
@@ -998,6 +1062,7 @@ describe("enterprise onboarding authentication", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "finish recommended setup" }),
     );
+    fireEvent.click(await screen.findByRole("button", { name: /Find something/ }));
     await waitFor(() =>
       expect(mocks.completeOnboarding).toHaveBeenCalledWith({
         method: "setup_finished",
@@ -1049,6 +1114,7 @@ describe("enterprise onboarding authentication", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "finish recommended setup" }),
     );
+    fireEvent.click(await screen.findByRole("button", { name: /Find something/ }));
     await waitFor(() =>
       expect(mocks.completeOnboarding).toHaveBeenCalledWith({
         method: "setup_finished",
@@ -1352,3 +1418,5 @@ describe("timeline slide sequencing", () => {
     },
   );
 });
+
+vi.mock("@/lib/workflows/rollout", () => ({ useWorkflowsRolloutEnabled: () => true, requireWorkflowsRollout: vi.fn() }));

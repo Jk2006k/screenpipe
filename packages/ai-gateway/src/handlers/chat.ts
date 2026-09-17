@@ -7,7 +7,8 @@ import { addCorsHeaders } from '../utils/cors';
 import { logModelOutcome } from '../services/model-health';
 import { isFrontierModel } from '../services/cost-tracker';
 import { isFlexEligible } from '../utils/latency';
-import { routeTier, routerArm, TIER_HEAD } from './difficulty-router';
+import { routerArm, TIER_HEAD } from './difficulty-router';
+import { pinAutoRoute, type AutoRouteScope, type PinnedAutoRoute } from '../services/auto-route';
 import { captureException } from '@sentry/cloudflare';
 import {
   HostedChatAllowanceExceededError,
@@ -123,6 +124,8 @@ const USER_INPUT_TOO_LARGE_PATTERNS = [
   /maximum context length/i,
   /context length.*exceeded/i,
   /request payload size exceeds/i,
+  /input tokens exceed the configured limit/i,
+  /exceeds the available context size/i,
   // Vertex MaaS (glm-5 etc): "The input (325052 tokens) is longer than the
   // model's context length (202752 tokens)" — SCREENPIPE-AI-PROXY-C, 28 users.
   /longer than the model'?s context length/i,
@@ -143,6 +146,10 @@ const CLIENT_PAYLOAD_PATTERNS: Array<{ re: RegExp; message: string }> = [
   {
     re: /at least one message is required/i,
     message: 'The request must include at least one user or assistant message.',
+  },
+  {
+    re: /tool_calls.*array too long.*maximum length/i,
+    message: 'A message contains too many tool calls. Start a new chat or compact the conversation and try again.',
   },
 ];
 
@@ -465,6 +472,7 @@ export async function runChain(
   maxAttempts: number = chain.length,
   gatewayContext?: HostedChatGatewayContext,
   attemptModel: typeof tryModel = tryModel,
+  beforeAttempt?: (model: string) => Promise<boolean>,
 ): Promise<{ response: Response; model: string } | { error: any; lastModel: string; limitError?: any }> {
   let lastError: any = null;
   let limitError: any = null;
@@ -472,6 +480,9 @@ export async function runChain(
   let lastModel = chain[0];
   for (const model of boundedModelChain(chain, maxAttempts)) {
     if (ctx === 'auto' && frontierPoolExhausted && isFrontierModel(model)) continue;
+    // State failures are terminal, outside the provider-error cascade: silently
+    // choosing another model would defeat the turn's cache/billing guarantee.
+    if (beforeAttempt && !await beforeAttempt(model)) continue;
     lastModel = model;
     try {
       const attemptGatewayContext = gatewayContext
@@ -855,6 +866,7 @@ export async function handleChatCompletions(
     gatewayContext?: HostedChatGatewayContext;
     backgroundFallback?: boolean;
     safetyRefusalFallback?: boolean;
+    autoRouteScope?: AutoRouteScope;
   } = {},
 ): Promise<Response> {
   // A request with no messages at all can never complete: OpenAI would
@@ -939,20 +951,26 @@ export async function handleChatCompletions(
     if (efficientOnly) {
       chain = efficientModelChain(chain);
     }
-    // Difficulty router (interactive text only). A/B by device: arm 'on' keeps
-    // trivial/normal requests on Luna and promotes hard requests to GPT-5.6 Sol;
-    // arm 'off' is the control baseline (chain unchanged = today's behavior). We tag
-    // router_tier on the response so the cost log can measure ON vs control.
     let routerTier: string | null = null;
-    if (!freePreview && !efficientOnly && !hasImages(body) && !useBackgroundChain) {
-      if (routerArm(deviceId, env) === 'on') {
-        const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
-        const tier = await routeTier(body.messages, env, { hasTools });
-        routerTier = tier;
-        if (tier !== 'normal') chain = [TIER_HEAD[tier], ...chain.filter((m) => m !== TIER_HEAD[tier])];
-      } else {
-        routerTier = 'control';
+    let pinned: PinnedAutoRoute | undefined;
+    if (!freePreview && !useBackgroundChain) {
+      const routerEnabled = routerArm(deviceId, env) === 'on';
+      routerTier = routerEnabled ? 'normal' : 'control';
+      if (options.autoRouteScope) {
+        try {
+          pinned = await pinAutoRoute(env, options.autoRouteScope, body, chain,
+            routerEnabled && !efficientOnly && !hasImages(body));
+        } catch {
+          return errorResponse(body, 503, 'Auto routing is temporarily unavailable. Please try again shortly.');
+        }
+        // Current entitlement/kill-switch gates always win over retained state.
+        chain = pinned.chain;
+        if (efficientOnly) chain = efficientModelChain(chain);
+        if (!routerEnabled) chain = chain.filter((model) => model !== TIER_HEAD.hard);
+        if (routerEnabled && !efficientOnly) routerTier = pinned.tier;
       }
+      // Legacy/no-session callers stay on Luna: never repeatedly guess frontier
+      // on requests that cannot be correlated into a stable logical turn.
     }
     const result = await runChain(
       chain,
@@ -962,6 +980,8 @@ export async function handleChatCompletions(
       flexEligible,
       freePreview ? FREE_PREVIEW_MAX_UPSTREAM_ATTEMPTS : chain.length,
       gatewayContext,
+      undefined,
+      pinned?.beforeAttempt,
     );
     if ('response' in result) {
       const resp = await finalizeProviderResponse(result.response, result.model);

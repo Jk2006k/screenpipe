@@ -15,9 +15,10 @@
 //!   * Heartbeated every 30 s by a background thread so a long recovery
 //!     (multi-GB DB) doesn't look stale.
 //!   * Released on normal Drop, on SIGINT, and on SIGTERM.
-//!   * The desktop app refuses to start while the lock is fresh
-//!     (`apps/screenpipe-app-tauri/src-tauri/src/main.rs`); env var
-//!     `SCREENPIPE_IGNORE_DB_LOCK=1` is the escape hatch.
+//!   * Desktop and CLI recording acquire the same lock through
+//!     `prepare_database_startup`, which reclaims dead owners before
+//!     reconciling interrupted recovery. A live owner blocks database startup,
+//!     while the desktop shell and its logs remain available.
 //!
 //! ## When the lock is "stale"
 //!
@@ -46,13 +47,12 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use sysinfo::{DiskExt, System, SystemExt};
+use sysinfo::{DiskExt, Pid, PidExt, System, SystemExt};
 
 use super::DbCommand;
 
@@ -61,7 +61,7 @@ const RECOVERY_MANIFEST_FILE: &str = "recovery-manifest.json";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const STALE_AFTER: Duration = Duration::from_secs(3600); // 1 h
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum RecoveryPhase {
     Preparing,
@@ -148,6 +148,10 @@ enum LockState {
 
 impl DbLock {
     fn acquire(data_dir: &Path, op: &str) -> Result<Self> {
+        Self::acquire_inner(data_dir, op, true)
+    }
+
+    fn acquire_inner(data_dir: &Path, op: &str, install_signal_handlers: bool) -> Result<Self> {
         let path = data_dir.join(LOCK_FILE);
         fs::create_dir_all(data_dir).ok();
 
@@ -213,7 +217,9 @@ will not auto-clear cross-host locks. resolve manually if needed.",
 
         let stop = Arc::new(AtomicBool::new(false));
         Self::start_heartbeat(&path, stop.clone());
-        Self::install_signal_handlers(&path, stop.clone());
+        if install_signal_handlers {
+            Self::install_signal_handlers(&path, stop.clone());
+        }
 
         Ok(Self { path, stop })
     }
@@ -321,16 +327,10 @@ fn pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    // `kill -0 <pid>` returns 0 if the process exists and we have permission
-    // to signal it. Avoids dragging in a libc dep on the engine just for this.
-    Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    // This lock also protects desktop startup on Windows, where an external
+    // `kill` executable is not available. Check the owner on every platform.
+    let mut system = System::new();
+    system.refresh_process(Pid::from_u32(pid))
 }
 
 // ── runtime checks ─────────────────────────────────────────────────────
@@ -384,9 +384,26 @@ fn available_disk_bytes(path: &Path) -> Option<u64> {
 
 pub async fn handle_db_command(command: &DbCommand) -> Result<()> {
     let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
+    if data_dir.join("storage.json").exists() {
+        if matches!(command, DbCommand::Check) {
+            let db = screenpipe_db::DatabaseManager::new(
+                data_dir
+                    .join("db.sqlite")
+                    .to_str()
+                    .context("invalid database path")?,
+                Default::default(),
+            )
+            .await?;
+            let result = db.verify_storage().await;
+            db.close().await;
+            result?;
+            return Ok(());
+        }
+        bail!("hybrid storage lifecycle uses screenpipe-storage verify, restore, compact, or resume migration");
+    }
     match command {
         DbCommand::Check => integrity_check(&data_dir.join("db.sqlite")),
-        DbCommand::Recover { force } => recover(&data_dir, *force).await,
+        DbCommand::Recover { force, resume } => recover(&data_dir, *force, *resume).await,
         DbCommand::Cleanup { apply, force } => cleanup(&data_dir, *apply, *force).await,
         DbCommand::Unlock { force } => unlock(&data_dir, *force),
     }
@@ -497,7 +514,50 @@ fn update_manifest(
     atomic_write_manifest(&phase_path, manifest)
 }
 
-#[derive(Debug, Eq, PartialEq)]
+// Phase records are immutable; the original manifest remains Preparing. Read
+// the latest durable phase rather than mistaking a completed swap for its start.
+fn read_latest_recovery_manifest(directory: &Path) -> Result<Option<RecoveryManifest>> {
+    let path = directory.join(RECOVERY_MANIFEST_FILE);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("reading recovery manifest"),
+    };
+    let initial: RecoveryManifest = serde_json::from_slice(&bytes)
+        .with_context(|| format!("reading recovery manifest {}", path.display()))?;
+    for phase in [
+        RecoveryPhase::RestoredAfterFailure,
+        RecoveryPhase::Complete,
+        RecoveryPhase::InstalledVerified,
+        RecoveryPhase::CandidateInstalled,
+        RecoveryPhase::OriginalArchived,
+        RecoveryPhase::CandidateVerified,
+    ] {
+        let phase_path = directory.join(format!("recovery-manifest-{}.json", phase.file_label()));
+        let bytes = match fs::read(&phase_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("reading recovery phase manifest"),
+        };
+        let latest: RecoveryManifest = serde_json::from_slice(&bytes)
+            .with_context(|| format!("reading recovery manifest {}", phase_path.display()))?;
+        if latest.phase != phase
+            || latest.schema_version != initial.schema_version
+            || latest.live_path != initial.live_path
+            || latest.original_identity != initial.original_identity
+            || latest.started_at_unix_ms != initial.started_at_unix_ms
+        {
+            bail!(
+                "recovery phase does not identify its original manifest: {}",
+                phase_path.display()
+            );
+        }
+        return Ok(Some(latest));
+    }
+    Ok(Some(initial))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct GenerationComponentFingerprint {
     name: String,
     identity: screenpipe_db::SqliteFileIdentity,
@@ -544,8 +604,9 @@ fn generation_fingerprint(live: &Path) -> Result<Vec<GenerationComponentFingerpr
 
 /// A quarantined app shell can cause SQLite to create a brand-new zero-byte
 /// WAL while rendering the recovery UI. That file contains no committed data
-/// and does not make the base database a newer generation. Keep rejecting any
-/// base DB change, any existing-sidecar change, and any WAL with bytes.
+/// and does not make the base database a newer generation. SHM is a transient
+/// WAL index, not committed data: a timestamp-only change is also harmless.
+/// Keep rejecting DB/WAL changes and SHM identity, size, or presence changes.
 fn recovery_source_is_current(
     source: &[GenerationComponentFingerprint],
     current: &[GenerationComponentFingerprint],
@@ -559,7 +620,15 @@ fn recovery_source_is_current(
         !newly_created_empty_wal
     });
 
-    source.iter().eq(current_without_new_empty_wal)
+    let current = current_without_new_empty_wal.collect::<Vec<_>>();
+    source.len() == current.len()
+        && source.iter().zip(current).all(|(before, after)| {
+            before == after
+                || (before.name == "db.sqlite-shm"
+                    && before.name == after.name
+                    && before.identity == after.identity
+                    && before.length == after.length)
+        })
 }
 
 fn prepare_readonly_generation(
@@ -750,19 +819,124 @@ fn newest_recovery_directories(data_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(directories)
 }
 
+/// Exclude offline reconciliation until the caller has bound its HTTP listener.
+/// Runtime maintenance still requires the caller to stop the recording process.
+pub struct DatabaseStartupGuard {
+    _lock: DbLock,
+}
+
+/// Reconcile interrupted replacement before ordinary SQLite startup can create
+/// a missing DB or verify a main file whose committed WAL is still archived.
+/// Unlike CLI maintenance, this guard never installs process-exit handlers.
+pub async fn prepare_database_startup(data_dir: &Path) -> Result<DatabaseStartupGuard> {
+    let lock = DbLock::acquire_inner(data_dir, "database startup", false)?;
+    let legacy = data_dir.join("db.sqlite");
+    let live = screenpipe_db::storage::resolve_database_path(&legacy)?;
+    if live == legacy {
+        reconcile_interrupted_recovery(data_dir, &live).await?;
+    }
+    Ok(DatabaseStartupGuard { _lock: lock })
+}
+
+async fn reconcile_interrupted_recovery(data_dir: &Path, live: &Path) -> Result<()> {
+    for directory in newest_recovery_directories(data_dir)? {
+        let manifest_path = directory.join(RECOVERY_MANIFEST_FILE);
+        let mut manifest = match read_latest_recovery_manifest(&directory)? {
+            Some(manifest) => manifest,
+            None => {
+                // A crash before preparing the manifest cannot have moved the
+                // source. Unexplained archived components require diagnosis.
+                if directory.join("source-generation").exists() {
+                    bail!(
+                        "interrupted recovery has archived data but no readable manifest: {}",
+                        directory.display()
+                    );
+                }
+                continue;
+            }
+        };
+        if manifest.schema_version != 1 || manifest.live_path != live {
+            bail!(
+                "recovery manifest does not identify this database: {}",
+                manifest_path.display()
+            );
+        }
+        let identity = screenpipe_db::sqlite_file_identity(live).ok();
+        if matches!(
+            manifest.phase,
+            RecoveryPhase::Complete | RecoveryPhase::RestoredAfterFailure
+        ) {
+            // A later completed repair supersedes evidence from earlier jobs.
+            if identity.as_ref() == Some(&manifest.original_identity)
+                || identity
+                    .as_ref()
+                    .is_some_and(|id| Some(id) == manifest.candidate_identity.as_ref())
+            {
+                return Ok(());
+            }
+            continue;
+        }
+        let source = directory.join("source-generation");
+        if identity.as_ref() == Some(&manifest.original_identity) || !live.exists() {
+            restore_interrupted_swap(data_dir, live)?;
+            if screenpipe_db::sqlite_file_identity(live)? != manifest.original_identity {
+                bail!("interrupted recovery did not restore the original database generation");
+            }
+            update_manifest(
+                &manifest_path,
+                &mut manifest,
+                RecoveryPhase::RestoredAfterFailure,
+            )?;
+            return Ok(());
+        }
+        if identity
+            .as_ref()
+            .is_some_and(|id| Some(id) == manifest.candidate_identity.as_ref())
+        {
+            // CandidateInstalled can mean the process died before its final
+            // durability check. Apply the existing complete verification battery
+            // before resolving the original quarantine or allowing startup.
+            let verified = screenpipe_db::verify_fresh_sqlite_recovery_candidate(
+                live,
+                &[manifest.original_identity.clone()],
+            )
+            .await
+            .context("verifying interrupted installed recovery candidate")?;
+            if Some(&verified.file_identity) != manifest.candidate_identity.as_ref() {
+                bail!("installed recovery candidate changed during verification");
+            }
+            screenpipe_db::archive_resolved_sqlite_quarantine(
+                live,
+                source.join("resolved-quarantine.json"),
+                &verified.file_identity,
+                &[manifest.original_identity.clone()],
+            )?;
+            update_manifest(&manifest_path, &mut manifest, RecoveryPhase::Complete)?;
+            return Ok(());
+        }
+        bail!(
+            "interrupted recovery does not identify the installed generation: {}",
+            directory.display()
+        );
+    }
+    Ok(())
+}
+
 /// Repair only the interrupted archive half of a previous swap. The durable
 /// quarantine marker remains active; this merely restores the exact old
 /// generation so a fresh recovery attempt has a coherent source.
 fn restore_interrupted_swap(data_dir: &Path, live: &Path) -> Result<()> {
     for directory in newest_recovery_directories(data_dir)? {
-        let manifest_path = directory.join(RECOVERY_MANIFEST_FILE);
-        let manifest: RecoveryManifest = match fs::read(&manifest_path)
-            .ok()
-            .and_then(|raw| serde_json::from_slice(&raw).ok())
-        {
+        let manifest = match read_latest_recovery_manifest(&directory)? {
             Some(manifest) => manifest,
             None => continue,
         };
+        if matches!(
+            manifest.phase,
+            RecoveryPhase::Complete | RecoveryPhase::RestoredAfterFailure
+        ) {
+            continue;
+        }
         let source_dir = directory.join("source-generation");
         let archived_db = source_dir.join("db.sqlite");
         let live_identity = screenpipe_db::sqlite_file_identity(live).ok();
@@ -782,8 +956,22 @@ fn restore_interrupted_swap(data_dir: &Path, live: &Path) -> Result<()> {
                     sqlite_sidecar(live, "-shm"),
                 ),
             ];
+            for (archived, destination) in &components {
+                if archived.exists() && destination.exists() {
+                    bail!(
+                        "interrupted recovery component conflicts with installed data: {}",
+                        destination.display()
+                    );
+                }
+            }
             for (archived, destination) in components {
                 if archived.exists() {
+                    if destination.exists() {
+                        bail!(
+                            "interrupted recovery component conflicts with installed data: {}",
+                            destination.display()
+                        );
+                    }
                     fs::rename(&archived, &destination).with_context(|| {
                         format!(
                             "restoring interrupted recovery component {} to {}",
@@ -810,6 +998,12 @@ fn restore_interrupted_swap(data_dir: &Path, live: &Path) -> Result<()> {
                         .file_name()
                         .expect("database sidecar has filename"),
                 );
+                if archived.exists() && destination.exists() {
+                    bail!(
+                        "interrupted recovery has conflicting live and archived sidecars: {}",
+                        destination.display()
+                    );
+                }
                 if !destination.exists() && archived.exists() {
                     fs::rename(&archived, &destination)?;
                     restored_sidecar = true;
@@ -828,13 +1022,125 @@ fn restore_interrupted_swap(data_dir: &Path, live: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn recover(data_dir: &Path, _force: bool) -> Result<()> {
+async fn recover(data_dir: &Path, _force: bool, resume: bool) -> Result<()> {
+    if data_dir.join("storage.json").exists() || data_dir.join("storage-migration.json").exists() {
+        bail!("hybrid recovery preserves its descriptor and payload bundle; use storage verification or restore");
+    }
+
     // A recovery that races even one live SQLite connection cannot promise an
     // exact source generation. `--force` is retained for CLI compatibility but
     // deliberately cannot override this architectural boundary.
     ensure_app_quit(false)?;
 
-    recover_offline(data_dir).await
+    if resume {
+        resume_recovery_offline(data_dir).await
+    } else {
+        recover_offline(data_dir).await
+    }
+}
+
+/// Compare only the small WAL copies; never read/copy the entire main database.
+fn same_file_bytes(left: &Path, right: &Path) -> Result<bool> {
+    if fs::metadata(left)?.len() != fs::metadata(right)?.len() {
+        return Ok(false);
+    }
+    let mut left = fs::File::open(left)?;
+    let mut right = fs::File::open(right)?;
+    let mut a = [0u8; 64 * 1024];
+    let mut b = [0u8; 64 * 1024];
+    loop {
+        let count = left.read(&mut a)?;
+        if count == 0 {
+            return Ok(right.read(&mut b[..1])? == 0);
+        }
+        right.read_exact(&mut b[..count])?;
+        if a[..count] != b[..count] {
+            return Ok(false);
+        }
+    }
+}
+
+fn validate_resume_source(
+    live: &Path,
+    recovery_dir: &Path,
+    manifest: &RecoveryManifest,
+) -> Result<Vec<GenerationComponentFingerprint>> {
+    let work = recovery_dir.join("working-copy/db.sqlite");
+    let candidate = recovery_dir.join("candidate.sqlite");
+    if manifest.schema_version != 1
+        || !matches!(manifest.phase, RecoveryPhase::CandidateVerified)
+        || fs::canonicalize(&manifest.live_path)? != fs::canonicalize(live)?
+        || recovery_dir.join("source-generation").exists()
+    {
+        bail!(
+            "cannot resume: candidate does not describe an uninstalled recovery for this database"
+        );
+    }
+    for path in [live, work.as_path(), candidate.as_path()] {
+        if !fs::symlink_metadata(path)?.file_type().is_file() {
+            bail!(
+                "cannot resume: expected a regular file at {}",
+                path.display()
+            );
+        }
+    }
+    let before = generation_fingerprint(live)?;
+    // v0.4.48 did not persist source fingerprints. Its original identity,
+    // surviving hard link, and pre-recovery DB/WAL write times establish that
+    // this is still its input. Fail closed if those facts cannot be established.
+    if before[0].identity != manifest.original_identity
+        || screenpipe_db::sqlite_file_identity(&work)? != manifest.original_identity
+        || manifest.started_at_unix_ms == 0
+        || before
+            .iter()
+            .filter(|part| part.name != "db.sqlite-shm")
+            .any(|part| {
+                !part.modified_unix_nanos.is_some_and(|modified| {
+                    modified < u128::from(manifest.started_at_unix_ms) * 1_000_000
+                })
+            })
+    {
+        bail!("cannot resume: original DB/WAL changed since this recovery started, or its read-only input link is missing");
+    }
+    let live_wal = sqlite_sidecar(live, "-wal");
+    let work_wal = sqlite_sidecar(&work, "-wal");
+    if live_wal.exists() != work_wal.exists()
+        || (live_wal.exists() && !same_file_bytes(&live_wal, &work_wal)?)
+    {
+        bail!("cannot resume: original WAL differs from the saved recovery input");
+    }
+    if manifest.candidate_identity.as_ref()
+        != Some(&screenpipe_db::sqlite_file_identity(&candidate)?)
+    {
+        bail!("cannot resume: candidate file identity changed since verification");
+    }
+    if !recovery_source_is_current(&before, &generation_fingerprint(live)?) {
+        bail!("cannot resume: source changed while checking the saved recovery input");
+    }
+    Ok(before)
+}
+
+async fn resume_recovery_offline(data_dir: &Path) -> Result<()> {
+    let _lock = DbLock::acquire(data_dir, "recover --resume")?;
+    let live = data_dir.join("db.sqlite");
+    if !screenpipe_db::sqlite_quarantine_exists(&live) {
+        bail!("cannot resume: no active database quarantine; no files were replaced");
+    }
+    for recovery_dir in newest_recovery_directories(data_dir)? {
+        let verified = recovery_dir.join("recovery-manifest-candidate-verified.json");
+        if !verified.exists() || !recovery_dir.join("candidate.sqlite").exists() {
+            continue;
+        }
+        let manifest: RecoveryManifest = serde_json::from_slice(&fs::read(&verified)?)
+            .context("reading verified recovery manifest")?;
+        let fingerprint = validate_resume_source(&live, &recovery_dir, &manifest)?;
+        println!("resuming verified candidate at {}", recovery_dir.display());
+        println!(
+            "rechecking the existing candidate; no database copy or page-level recovery needed"
+        );
+        return verify_and_install_candidate(data_dir, &recovery_dir, manifest, fingerprint).await;
+    }
+    bail!("no previously verified candidate available to resume; no new recovery was started and no database files were replaced")
 }
 
 /// Recover a database that was durably quarantined by the running app.
@@ -843,6 +1149,10 @@ async fn recover(data_dir: &Path, _force: bool) -> Result<()> {
 /// the server or capture. Requiring the durable marker keeps an accidental UI
 /// invocation from turning an ordinary healthy database into a recovery job.
 pub async fn recover_quarantined_database(data_dir: &Path) -> Result<()> {
+    if data_dir.join("storage.json").exists() || data_dir.join("storage-migration.json").exists() {
+        bail!("hybrid recovery preserves its descriptor and payload bundle; use storage verification or restore");
+    }
+
     let live = data_dir.join("db.sqlite");
     if !screenpipe_db::sqlite_quarantine_exists(&live) {
         bail!(
@@ -858,39 +1168,39 @@ async fn recover_offline(data_dir: &Path) -> Result<()> {
     let live = data_dir.join("db.sqlite");
     fs::create_dir_all(data_dir)?;
     let _lock = DbLock::acquire(data_dir, "recover")?;
-    restore_interrupted_swap(data_dir, &live)?;
+    reconcile_interrupted_recovery(data_dir, &live).await?;
     if !live.exists() {
         bail!("no database at {}", live.display());
     }
+    // An explicit recovery request or an old marker is not proof that salvage
+    // is needed. Diagnose before allocating a copy or requiring free space.
+    let verified_damage = screenpipe_db::sqlite_confirmed_corruption_exists(&live);
+    if !verified_damage {
+        let token = screenpipe_db::begin_sqlite_verification(&live)?;
+        match screenpipe_db::inspect_database_health(&live).await {
+            Ok(_) => {
+                screenpipe_db::admit_verified_sqlite_generation(token)?;
+                println!("database verified healthy; no rebuild needed");
+                return Ok(());
+            }
+            Err(screenpipe_db::DatabaseHealthError::Unavailable(error)) => {
+                return Err(error).context("database access is unavailable; retry when storage is available, no rebuild started");
+            }
+            Err(screenpipe_db::DatabaseHealthError::Corrupt(detail)) => {
+                screenpipe_db::quarantine_verified_sqlite_generation(token, Some(11), detail)?;
+            }
+        }
+    }
     let original_identity = screenpipe_db::sqlite_file_identity(&live)
         .with_context(|| format!("identifying quarantined database {}", live.display()))?;
-    let marker = match screenpipe_db::read_sqlite_quarantine(&live) {
-        Ok(marker) => marker,
-        Err(error) => {
-            eprintln!(
-                "warning: active quarantine marker is unreadable ({error}); keeping it fail-closed until recovery completes"
-            );
-            None
-        }
-    };
-    if !screenpipe_db::sqlite_quarantine_exists(&live) {
-        screenpipe_db::persist_sqlite_quarantine(
-            &live,
-            None,
-            "offline database recovery in progress",
-        )
-        .context("persisting recovery-in-progress quarantine")?;
-    }
-
     let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
     let recovery_dir = data_dir.join(format!("db-recovery-{ts}-{}", std::process::id()));
     let work_dir = recovery_dir.join("working-copy");
-    let source_dir = recovery_dir.join("source-generation");
     fs::create_dir_all(&work_dir)?;
     let work = work_dir.join("db.sqlite");
     let candidate = recovery_dir.join("candidate.sqlite");
     let manifest_path = recovery_dir.join(RECOVERY_MANIFEST_FILE);
-    let mut manifest = RecoveryManifest {
+    let manifest = RecoveryManifest {
         schema_version: 1,
         phase: RecoveryPhase::Preparing,
         live_path: live.clone(),
@@ -923,7 +1233,31 @@ async fn recover_offline(data_dir: &Path) -> Result<()> {
         println!("  rebuilt FTS5 indexes: {}", rebuilt_fts.join(", "));
     }
 
-    let mut forbidden_identities = vec![original_identity.clone()];
+    verify_and_install_candidate(data_dir, &recovery_dir, manifest, source_fingerprint).await
+}
+
+async fn verify_and_install_candidate(
+    data_dir: &Path,
+    recovery_dir: &Path,
+    mut manifest: RecoveryManifest,
+    source_fingerprint: Vec<GenerationComponentFingerprint>,
+) -> Result<()> {
+    let live = data_dir.join("db.sqlite");
+    let work_dir = recovery_dir.join("working-copy");
+    let source_dir = recovery_dir.join("source-generation");
+    let candidate = recovery_dir.join("candidate.sqlite");
+    let manifest_path = recovery_dir.join(RECOVERY_MANIFEST_FILE);
+    let source_table_count = table_count(&work_dir.join("db.sqlite")).unwrap_or(0);
+    let marker = match screenpipe_db::read_sqlite_quarantine(&live) {
+        Ok(marker) => marker,
+        Err(error) => {
+            eprintln!(
+                "warning: active quarantine marker is unreadable ({error}); keeping it fail-closed until recovery completes"
+            );
+            None
+        }
+    };
+    let mut forbidden_identities = vec![manifest.original_identity.clone()];
     if let Some(marker_identity) = marker.and_then(|marker| marker.file_identity) {
         if !forbidden_identities.contains(&marker_identity) {
             forbidden_identities.push(marker_identity);
@@ -958,12 +1292,18 @@ async fn recover_offline(data_dir: &Path) -> Result<()> {
         );
     }
 
-    manifest.candidate_identity = Some(candidate_verification.file_identity.clone());
-    update_manifest(
-        &manifest_path,
-        &mut manifest,
-        RecoveryPhase::CandidateVerified,
-    )?;
+    if matches!(manifest.phase, RecoveryPhase::CandidateVerified) {
+        if manifest.candidate_identity.as_ref() != Some(&candidate_verification.file_identity) {
+            bail!("candidate identity changed during resumed verification; original remains untouched");
+        }
+    } else {
+        manifest.candidate_identity = Some(candidate_verification.file_identity.clone());
+        update_manifest(
+            &manifest_path,
+            &mut manifest,
+            RecoveryPhase::CandidateVerified,
+        )?;
+    }
 
     let current_fingerprint = generation_fingerprint(&live)?;
     if !recovery_source_is_current(&source_fingerprint, &current_fingerprint) {
@@ -1292,6 +1632,22 @@ mod recovery_tests {
     use super::*;
     use std::io::{Seek, SeekFrom};
 
+    #[test]
+    fn recovery_cli_accepts_explicit_resume_without_force() {
+        use clap::Parser;
+        let cli = super::super::Cli::try_parse_from(["screenpipe", "db", "recover", "--resume"])
+            .expect("customer resume command must parse");
+        assert!(matches!(
+            cli.command,
+            super::super::Command::Db {
+                subcommand: DbCommand::Recover {
+                    resume: true,
+                    force: false
+                }
+            }
+        ));
+    }
+
     fn write_generation(live: &Path) {
         fs::write(live, b"database-bytes").expect("write db");
         fs::write(sqlite_sidecar(live, "-wal"), b"wal-bytes").expect("write wal");
@@ -1417,6 +1773,221 @@ mod recovery_tests {
     }
 
     #[test]
+    fn recovery_accepts_shm_timestamp_only_but_rejects_generation_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("db.sqlite");
+        write_generation(&live);
+        let source = generation_fingerprint(&live).unwrap();
+        for index in 0..3 {
+            let mut current = source.clone();
+            current[index].modified_unix_nanos = Some(42);
+            assert_eq!(recovery_source_is_current(&source, &current), index == 2);
+            current = source.clone();
+            current[index].length += 1;
+            assert!(!recovery_source_is_current(&source, &current));
+            current = source.clone();
+            current[index].identity = source[(index + 1) % 3].identity.clone();
+            assert!(!recovery_source_is_current(&source, &current));
+            current = source.clone();
+            current.remove(index);
+            assert!(!recovery_source_is_current(&source, &current));
+        }
+    }
+
+    fn set_modified(path: &Path, time: SystemTime) {
+        OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+
+    /// Create the exact v0.4.48 on-disk state after candidate verification and
+    /// before installation, including a row present only in the copied WAL.
+    async fn resumable_fixture(data_dir: &Path) -> (PathBuf, RecoveryManifest) {
+        fs::create_dir_all(data_dir).unwrap();
+        let seed = data_dir.join("seed.sqlite");
+        let writer = Connection::open(&seed).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; \
+             CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT); \
+             PRAGMA wal_checkpoint(TRUNCATE); \
+             INSERT INTO records VALUES (1, 'only-in-wal');",
+            )
+            .unwrap();
+        let live = data_dir.join("db.sqlite");
+        for suffix in ["", "-wal", "-shm"] {
+            let destination = data_dir.join(format!("db.sqlite{suffix}"));
+            fs::copy(data_dir.join(format!("seed.sqlite{suffix}")), &destination).unwrap();
+            set_modified(
+                &destination,
+                UNIX_EPOCH + Duration::from_secs(now_unix() - 60),
+            );
+        }
+        drop(writer);
+        let directory = data_dir.join("db-recovery-20260906-000000-48");
+        fs::create_dir_all(directory.join("working-copy")).unwrap();
+        let work = directory.join("working-copy/db.sqlite");
+        let candidate = directory.join("candidate.sqlite");
+        let mut manifest = test_manifest(&live);
+        manifest.started_at_unix_ms = now_unix() * 1000;
+        atomic_write_manifest(&directory.join(RECOVERY_MANIFEST_FILE), &manifest).unwrap();
+        prepare_readonly_generation(&live, &work).unwrap();
+        screenpipe_sqlite_recovery::recover_database(&work, &candidate).unwrap();
+        let verification = screenpipe_db::verify_fresh_sqlite_recovery_candidate(
+            &candidate,
+            &[manifest.original_identity.clone()],
+        )
+        .await
+        .unwrap();
+        manifest.candidate_identity = Some(verification.file_identity);
+        update_manifest(
+            &directory.join(RECOVERY_MANIFEST_FILE),
+            &mut manifest,
+            RecoveryPhase::CandidateVerified,
+        )
+        .unwrap();
+        screenpipe_db::persist_sqlite_quarantine(&live, Some(11), "resume fixture").unwrap();
+        (directory, manifest)
+    }
+
+    fn triplet_bytes(live: &Path) -> Vec<Vec<u8>> {
+        [
+            live.to_path_buf(),
+            sqlite_sidecar(live, "-wal"),
+            sqlite_sidecar(live, "-shm"),
+        ]
+        .iter()
+        .map(|path| fs::read(path).unwrap())
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn resume_048_candidate_after_shm_timestamp_change_without_recovering_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (recovery_dir, manifest) = resumable_fixture(dir.path()).await;
+        let live = dir.path().join("db.sqlite");
+        let originals = triplet_bytes(&live);
+        set_modified(&sqlite_sidecar(&live, "-shm"), SystemTime::now());
+        resume_recovery_offline(dir.path())
+            .await
+            .expect("resume verified 0.4.48 candidate");
+        assert_eq!(
+            Some(screenpipe_db::sqlite_file_identity(&live).unwrap()),
+            manifest.candidate_identity
+        );
+        assert_eq!(
+            newest_recovery_directories(dir.path()).unwrap(),
+            vec![recovery_dir.clone()]
+        );
+        assert!(!screenpipe_db::sqlite_quarantine_exists(&live));
+        assert_eq!(
+            triplet_bytes(&recovery_dir.join("source-generation/db.sqlite")),
+            originals
+        );
+        let connection =
+            Connection::open_with_flags(&live, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM records WHERE id=1", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "only-in-wal"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_changed_db_or_wal_and_preserves_originals() {
+        for suffix in ["", "-wal"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (recovery_dir, _) = resumable_fixture(dir.path()).await;
+            let live = dir.path().join("db.sqlite");
+            set_modified(
+                &dir.path().join(format!("db.sqlite{suffix}")),
+                SystemTime::now(),
+            );
+            let originals = triplet_bytes(&live);
+            let error = resume_recovery_offline(dir.path()).await.unwrap_err();
+            assert!(error.to_string().contains("changed since"), "{error:#}");
+            assert_eq!(triplet_bytes(&live), originals);
+            assert!(recovery_dir.join("candidate.sqlite").exists());
+            assert!(screenpipe_db::sqlite_quarantine_exists(&live));
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_checks_wal_bytes_even_with_unchanged_size_and_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, manifest) = resumable_fixture(dir.path()).await;
+        let live = dir.path().join("db.sqlite");
+        let wal = sqlite_sidecar(&live, "-wal");
+        let modified = fs::metadata(&wal).unwrap().modified().unwrap();
+        let mut bytes = fs::read(&wal).unwrap();
+        bytes[40] ^= 0xff;
+        fs::write(&wal, bytes).unwrap();
+        set_modified(&wal, modified);
+        let originals = triplet_bytes(&live);
+        let error = resume_recovery_offline(dir.path()).await.unwrap_err();
+        assert!(error.to_string().contains("WAL differs"), "{error:#}");
+        assert_eq!(triplet_bytes(&live), originals);
+        assert_eq!(
+            screenpipe_db::sqlite_file_identity(&live).unwrap(),
+            manifest.original_identity
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_revalidates_candidate_and_never_swaps_a_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (recovery_dir, _) = resumable_fixture(dir.path()).await;
+        let live = dir.path().join("db.sqlite");
+        let originals = triplet_bytes(&live);
+        fs::write(recovery_dir.join("candidate.sqlite"), b"not a database").unwrap();
+        let error = resume_recovery_offline(dir.path()).await.unwrap_err();
+        assert!(
+            error.to_string().contains("candidate failed verification"),
+            "{error:#}"
+        );
+        assert_eq!(triplet_bytes(&live), originals);
+        assert!(!recovery_dir.join("source-generation").exists());
+        assert!(screenpipe_db::sqlite_quarantine_exists(&live));
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_replaced_candidate_or_missing_input_link() {
+        for target in ["candidate.sqlite", "working-copy/db.sqlite"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (recovery_dir, _) = resumable_fixture(dir.path()).await;
+            let live = dir.path().join("db.sqlite");
+            let originals = triplet_bytes(&live);
+            let target = recovery_dir.join(target);
+            let saved = recovery_dir.join("saved.sqlite");
+            fs::rename(&target, &saved).unwrap();
+            fs::copy(&saved, &target).unwrap();
+            assert!(resume_recovery_offline(dir.path()).await.is_err());
+            assert_eq!(triplet_bytes(&live), originals);
+            assert!(screenpipe_db::sqlite_quarantine_exists(&live));
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_without_verified_candidate_does_not_start_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("db.sqlite");
+        write_generation(&live);
+        screenpipe_db::persist_sqlite_quarantine(&live, Some(11), "resume fixture").unwrap();
+        let originals = triplet_bytes(&live);
+        let error = resume_recovery_offline(dir.path()).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("no previously verified candidate"));
+        assert!(newest_recovery_directories(dir.path()).unwrap().is_empty());
+        assert_eq!(triplet_bytes(&live), originals);
+    }
+
+    #[test]
     fn archive_failure_rolls_every_component_back() {
         let dir = tempfile::tempdir().expect("tempdir");
         let live = dir.path().join("db.sqlite");
@@ -1483,6 +2054,196 @@ mod recovery_tests {
             b"wal-bytes"
         );
         assert!(live.exists());
+    }
+
+    #[tokio::test]
+    async fn startup_restores_committed_sidecars_before_database_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("db.sqlite");
+        write_generation(&live);
+        let manifest = test_manifest(&live);
+        let recovery = dir.path().join("db-recovery-interrupted");
+        let source = recovery.join("source-generation");
+        fs::create_dir_all(&source).unwrap();
+        atomic_write_manifest(&recovery.join(RECOVERY_MANIFEST_FILE), &manifest).unwrap();
+        fs::rename(sqlite_sidecar(&live, "-wal"), source.join("db.sqlite-wal")).unwrap();
+
+        let guard = prepare_database_startup(dir.path()).await.unwrap();
+        assert_eq!(
+            fs::read(sqlite_sidecar(&live, "-wal")).unwrap(),
+            b"wal-bytes"
+        );
+        assert!(DbLock::acquire_inner(dir.path(), "competing repair", false).is_err());
+        drop(guard);
+        let _next_start = prepare_database_startup(dir.path()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_conflicting_recovery_sidecars_without_overwriting_either() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("db.sqlite");
+        write_generation(&live);
+        let manifest = test_manifest(&live);
+        let recovery = dir.path().join("db-recovery-conflict");
+        let source = recovery.join("source-generation");
+        fs::create_dir_all(&source).unwrap();
+        atomic_write_manifest(&recovery.join(RECOVERY_MANIFEST_FILE), &manifest).unwrap();
+        fs::write(source.join("db.sqlite-wal"), b"different-committed-data").unwrap();
+        assert!(prepare_database_startup(dir.path()).await.is_err());
+        assert_eq!(
+            fs::read(sqlite_sidecar(&live, "-wal")).unwrap(),
+            b"wal-bytes"
+        );
+        assert_eq!(
+            fs::read(source.join("db.sqlite-wal")).unwrap(),
+            b"different-committed-data"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_verifies_an_installed_candidate_before_completing_interrupted_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("db.sqlite");
+        {
+            let connection = Connection::open(&live).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE records(id INTEGER PRIMARY KEY); INSERT INTO records VALUES(1);",
+                )
+                .unwrap();
+        }
+        let mut manifest = test_manifest(&live);
+        screenpipe_db::persist_sqlite_quarantine(&live, Some(10), "legacy interrupted repair")
+            .unwrap();
+        let recovery = dir.path().join("db-recovery-installed");
+        let source = recovery.join("source-generation");
+        fs::create_dir_all(&source).unwrap();
+        move_generation(&live, &source).unwrap();
+        {
+            let connection = Connection::open(&live).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE records(id INTEGER PRIMARY KEY); INSERT INTO records VALUES(1);",
+                )
+                .unwrap();
+        }
+        manifest.phase = RecoveryPhase::Preparing;
+        atomic_write_manifest(&recovery.join(RECOVERY_MANIFEST_FILE), &manifest).unwrap();
+        manifest.candidate_identity = Some(screenpipe_db::sqlite_file_identity(&live).unwrap());
+        update_manifest(
+            &recovery.join(RECOVERY_MANIFEST_FILE),
+            &mut manifest,
+            RecoveryPhase::CandidateInstalled,
+        )
+        .unwrap();
+
+        let _guard = prepare_database_startup(dir.path()).await.unwrap();
+        assert!(!screenpipe_db::sqlite_quarantine_exists(&live));
+        let completed = read_latest_recovery_manifest(&recovery).unwrap().unwrap();
+        assert!(matches!(completed.phase, RecoveryPhase::Complete));
+        assert!(source.join("db.sqlite").exists());
+        let connection = Connection::open(&live).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM records", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_does_not_create_a_database_when_recovery_manifest_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let recovery = dir.path().join("db-recovery-unreadable");
+        fs::create_dir_all(&recovery).unwrap();
+        fs::write(recovery.join(RECOVERY_MANIFEST_FILE), b"interrupted json").unwrap();
+        assert!(prepare_database_startup(dir.path()).await.is_err());
+        assert!(!dir.path().join("db.sqlite").exists());
+    }
+
+    #[test]
+    fn recovery_lock_recognizes_the_current_process_on_this_platform() {
+        assert!(pid_alive(std::process::id()));
+    }
+
+    #[tokio::test]
+    async fn startup_recovers_immediately_after_lock_owner_is_force_quit() {
+        const CHILD_DATA_DIR: &str = "SCREENPIPE_TEST_FORCE_QUIT_DB_LOCK_DIR";
+        if let Some(data_dir) = std::env::var_os(CHILD_DATA_DIR).map(PathBuf::from) {
+            let _guard = prepare_database_startup(&data_dir).await.unwrap();
+            let live = data_dir.join("db.sqlite");
+            let recovery = data_dir.join("db-recovery-force-quit");
+            let source = recovery.join("source-generation");
+            fs::create_dir_all(&source).unwrap();
+            atomic_write_manifest(
+                &recovery.join(RECOVERY_MANIFEST_FILE),
+                &test_manifest(&live),
+            )
+            .unwrap();
+            fs::rename(sqlite_sidecar(&live, "-wal"), source.join("db.sqlite-wal")).unwrap();
+            fs::write(data_dir.join("ready"), b"lock held; WAL move interrupted").unwrap();
+            // Bound the child lifetime even if the parent test fails.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            panic!("parent did not force quit the lock owner");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("db.sqlite");
+        write_generation(&live);
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cli::db::recovery_tests::startup_recovers_immediately_after_lock_owner_is_force_quit",
+                "--nocapture",
+            ])
+            .env(CHILD_DATA_DIR, dir.path())
+            .spawn()
+            .unwrap();
+        let ready = tokio::time::timeout(Duration::from_secs(10), async {
+            while !dir.path().join("ready").exists() {
+                if child.try_wait().unwrap().is_some() {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            true
+        })
+        .await;
+        if !matches!(ready, Ok(true)) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("child did not acquire the database startup lock");
+        }
+
+        let blocked = prepare_database_startup(dir.path()).await;
+        let wal_still_archived = !sqlite_sidecar(&live, "-wal").exists();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(blocked.is_err(), "a live owner must keep recovery excluded");
+        assert!(
+            wal_still_archived,
+            "blocked startup must not reconcile the WAL"
+        );
+        assert!(
+            dir.path().join(LOCK_FILE).exists(),
+            "force quit leaves the lock file"
+        );
+        assert!(!pid_alive(child.id()));
+
+        let _guard = prepare_database_startup(dir.path()).await.unwrap();
+        assert_eq!(fs::read(&live).unwrap(), b"database-bytes");
+        assert_eq!(
+            fs::read(sqlite_sidecar(&live, "-wal")).unwrap(),
+            b"wal-bytes"
+        );
+        assert_eq!(
+            fs::read(sqlite_sidecar(&live, "-shm")).unwrap(),
+            b"shm-bytes"
+        );
+        let replacement: LockPayload =
+            serde_json::from_slice(&fs::read(dir.path().join(LOCK_FILE)).unwrap()).unwrap();
+        assert_eq!(replacement.pid, std::process::id());
     }
 
     #[tokio::test]
@@ -1577,9 +2338,8 @@ mod recovery_tests {
         screenpipe_db::persist_sqlite_quarantine(&live, Some(11), "test corruption")
             .expect("persist quarantine");
 
-        // Exercise the complete offline recovery pipeline without making the
-        // test depend on whether a developer has screenpipe on port 3030.
-        // The public wrapper's live-server guard remains unchanged.
+        // This isolated fixture has no live owners. Exercise offline recovery
+        // without depending on whether the developer's unrelated app uses 3030.
         recover_offline(data_dir)
             .await
             .expect("end-to-end offline recovery");
@@ -1679,10 +2439,21 @@ mod recovery_tests {
         let writer = Connection::open(&seed).unwrap();
         writer
             .execute_batch(
-                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; \
+                "PRAGMA page_size=4096; PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; \
              CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT); \
+             CREATE TABLE indexed_records (id INTEGER PRIMARY KEY, value TEXT); \
+             CREATE INDEX damaged_index ON indexed_records(value); \
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<200) \
+             INSERT INTO indexed_records SELECT x, printf('value-%04d',x) FROM n; \
              PRAGMA wal_checkpoint(TRUNCATE); \
              INSERT INTO records VALUES (1, 'only-in-wal');",
+            )
+            .unwrap();
+        let index_root: i64 = writer
+            .query_row(
+                "SELECT rootpage FROM sqlite_schema WHERE name='damaged_index'",
+                [],
+                |row| row.get(0),
             )
             .unwrap();
         let data_dir = dir.path().join("data");
@@ -1690,13 +2461,29 @@ mod recovery_tests {
         let live = data_dir.join("db.sqlite");
         let mut originals = Vec::new();
         for suffix in ["", "-wal", "-shm"] {
-            let bytes = fs::read(dir.path().join(format!("seed.sqlite{suffix}"))).unwrap();
+            let mut bytes = fs::read(dir.path().join(format!("seed.sqlite{suffix}"))).unwrap();
+            if suffix.is_empty() {
+                let start = ((index_root - 1) * 4096 + 100) as usize;
+                bytes[start..start + 512].fill(0xff);
+            }
             fs::write(data_dir.join(format!("db.sqlite{suffix}")), &bytes).unwrap();
-            originals.push((suffix, bytes));
         }
         drop(writer);
         let identity = screenpipe_db::sqlite_file_identity(&live).unwrap();
-        screenpipe_db::persist_sqlite_quarantine(&live, Some(11), "WAL recovery test").unwrap();
+        // A legacy error code alone must not rebuild a healthy database. Prove
+        // real index damage while the WAL-only recording row remains intact.
+        let token = screenpipe_db::begin_sqlite_verification(&live).unwrap();
+        let damage = match screenpipe_db::inspect_database_health(&live).await {
+            Err(screenpipe_db::DatabaseHealthError::Corrupt(detail)) => detail,
+            result => panic!("expected verified index damage, got {result:?}"),
+        };
+        screenpipe_db::quarantine_verified_sqlite_generation(token, Some(11), damage).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            originals.push((
+                suffix,
+                fs::read(data_dir.join(format!("db.sqlite{suffix}"))).unwrap(),
+            ));
+        }
         recover_offline(&data_dir)
             .await
             .expect("recover and install WAL generation");

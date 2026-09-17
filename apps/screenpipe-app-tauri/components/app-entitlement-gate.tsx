@@ -51,6 +51,9 @@ export type StartupAuthenticationStatus =
   | "logged_out"
   | "not_required";
 
+export const StartupAuthenticationContext =
+  React.createContext<StartupAuthenticationStatus>("authenticated");
+
 function getDownloadPlatform(): string | null {
   try {
     const os = getOsPlatform();
@@ -89,8 +92,8 @@ function EntitlementShell({
     <div className="min-h-screen w-full bg-background text-foreground flex items-center justify-center px-6">
       <div className="w-full max-w-[440px] border border-border bg-background px-8 py-7 shadow-sm">
         <div className="mb-7">
-          <p className="font-mono text-[10px] uppercase tracking-[0.28em] text-muted-foreground">
-            screenpipe
+          <p className="font-mono text-[10px] normal-case tracking-[0.28em] text-muted-foreground">
+            Screenpipe
           </p>
           <h1 className="mt-3 text-2xl font-semibold tracking-tight">
             {title}
@@ -651,8 +654,8 @@ export function AppEntitlementGate({
 
   const devLoginBlock = isDevLoginEnabled() ? (
     <div className="mt-5 border-t border-border pt-4">
-      <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-muted-foreground mb-2">
-        dev login
+      <p className="font-mono text-[10px] normal-case tracking-[0.2em] text-muted-foreground mb-2">
+        Dev login
       </p>
       <input
         value={devToken}
@@ -670,7 +673,7 @@ export function AppEntitlementGate({
         className="mt-2 w-full"
         disabled={devSubmitting || !devToken.trim()}
       >
-        {devSubmitting ? "signing in…" : "dev sign in"}
+        {devSubmitting ? "Signing in…" : "Dev sign in"}
       </Button>
       {devError && (
         <p className="mt-1 font-mono text-[11px] leading-5 text-destructive">
@@ -683,8 +686,8 @@ export function AppEntitlementGate({
   if (!isSettingsLoaded) {
     return (
       <EntitlementShell
-        title="loading"
-        description="checking local settings before starting screenpipe."
+        title="Loading"
+        description="Checking local settings before starting screenpipe."
       >
         <div className="h-10 w-full animate-pulse bg-muted" />
       </EntitlementShell>
@@ -692,30 +695,34 @@ export function AppEntitlementGate({
   }
 
   if (!shouldGate) {
-    return <>{children}</>;
+    return (
+      <StartupAuthenticationContext.Provider value={authenticationStatus}>
+        {children}
+      </StartupAuthenticationContext.Provider>
+    );
   }
 
   if (!isManagedDeploymentResolved) {
     if (managedDeploymentResolutionError) {
       return (
         <EntitlementShell
-          title="couldn't check access"
-          description="screenpipe could not confirm which build is installed. it will retry automatically."
+          title="Couldn't check access"
+          description="Screenpipe could not confirm which build is installed. It will retry automatically."
         >
           <Button
             onClick={() => window.location.reload()}
             variant="secondary"
             className="w-full"
           >
-            reload and retry
+            Reload and retry
           </Button>
         </EntitlementShell>
       );
     }
     return (
       <EntitlementShell
-        title="checking access"
-        description="checking which screenpipe build is installed on this device."
+        title="Checking access"
+        description="Checking which screenpipe build is installed on this device."
       >
         <div className="h-10 w-full animate-pulse bg-muted" />
       </EntitlementShell>
@@ -725,8 +732,8 @@ export function AppEntitlementGate({
   if (isManagedDeployment && authenticationState === "checking") {
     return (
       <EntitlementShell
-        title="checking enterprise access"
-        description="checking this device for an existing account or enterprise key."
+        title="Checking enterprise access"
+        description="Checking this device for an existing account or enterprise key."
       >
         <div className="h-10 w-full animate-pulse bg-muted" />
       </EntitlementShell>
@@ -736,8 +743,8 @@ export function AppEntitlementGate({
   if (isManagedDeployment && authenticationState === "choice") {
     return (
       <EntitlementShell
-        title="enterprise access"
-        description="use your organization account or the enterprise key provided by your administrator."
+        title="Enterprise access"
+        description="Use your organization account or the enterprise key provided by your administrator."
       >
         <div className="flex flex-col gap-3">
           <Button
@@ -748,7 +755,7 @@ export function AppEntitlementGate({
             className="w-full gap-2"
           >
             <LogIn className="h-4 w-4" />
-            sign in with enterprise account
+            Sign in with enterprise account
           </Button>
           {licenseKeyAllowed && (
             <Button
@@ -757,7 +764,7 @@ export function AppEntitlementGate({
               className="w-full gap-2"
             >
               <KeyRound className="h-4 w-4" />
-              use enterprise key
+              Use enterprise key
             </Button>
           )}
         </div>
@@ -769,8 +776,8 @@ export function AppEntitlementGate({
   if (isManagedDeployment && authenticationState === "license_key") {
     return (
       <EntitlementShell
-        title="enterprise key"
-        description={authenticationError || "enter the key provided by your administrator."}
+        title="Enterprise key"
+        description={authenticationError || "Enter the key provided by your administrator."}
       >
         <EnterpriseLicensePrompt
           embedded
@@ -788,10 +795,10 @@ export function AppEntitlementGate({
     const signedIn = Boolean(user?.token);
     return (
       <EntitlementShell
-        title={signedIn ? "account not authorized" : "sign in required"}
+        title={signedIn ? "Account not authorized" : "Sign in required"}
         description={
           authenticationError ||
-          "sign in with an account associated with the enterprise organization."
+          "Sign in with an account associated with the enterprise organization."
         }
       >
         <div className="flex flex-col gap-3">
@@ -800,7 +807,7 @@ export function AppEntitlementGate({
             className="w-full gap-2"
           >
             <LogIn className="h-4 w-4" />
-            {signedIn ? "use different account" : "sign in"}
+            {signedIn ? "Use different account" : "Sign in"}
           </Button>
           {licenseKeyAllowed && (
             <Button
@@ -809,7 +816,7 @@ export function AppEntitlementGate({
               className="w-full gap-2"
             >
               <KeyRound className="h-4 w-4" />
-              use enterprise key
+              Use enterprise key
             </Button>
           )}
         </div>
@@ -821,13 +828,13 @@ export function AppEntitlementGate({
   if (shouldGateForEnterpriseApp) {
     return (
       <EntitlementShell
-        title="enterprise app required"
+        title="Enterprise app required"
         description={`${email} belongs to ${enterpriseOrgName}. download the screenpipe enterprise app so this device follows workspace policy and uploads to your org storage.`}
       >
         <div className="flex flex-col gap-3">
           <Button onClick={downloadEnterpriseApp} className="w-full gap-2">
             <Download className="h-4 w-4" />
-            download enterprise app
+            Download enterprise app
           </Button>
           <Button
             onClick={() =>
@@ -839,14 +846,14 @@ export function AppEntitlementGate({
             className="w-full gap-2"
           >
             <Building2 className="h-4 w-4" />
-            open enterprise builds
+            Open enterprise builds
           </Button>
           <Button
             onClick={useDifferentAccount}
             variant="ghost"
             className="w-full"
           >
-            use different account
+            Use different account
           </Button>
         </div>
         {devLoginBlock}
@@ -857,13 +864,13 @@ export function AppEntitlementGate({
   if (!user?.token) {
     return (
       <EntitlementShell
-        title="sign in required"
-        description="create or sign in to a screenpipe account to start the free plan."
+        title="Sign in required"
+        description="Create or sign in to a screenpipe account to start the free plan."
       >
         <div className="flex flex-col gap-3">
           <Button onClick={openLogin} className="w-full gap-2">
             <LogIn className="h-4 w-4" />
-            sign in
+            Sign in
           </Button>
         </div>
         {devLoginBlock}
@@ -877,14 +884,14 @@ export function AppEntitlementGate({
     <EntitlementShell
       title={
         needsRefresh || shouldVerifyPlan
-          ? "refresh access"
-          : "subscription required"
+          ? "Refresh access"
+          : "Subscription required"
       }
       description={
         needsRefresh
           ? `${email} has saved app access, but screenpipe needs to verify it again before recording starts.`
           : shouldVerifyPlan
-            ? `screenpipe could not verify the plan for ${email}. refresh the account before recording starts.`
+            ? `Screenpipe could not verify the plan for ${email}. refresh the account before recording starts.`
           : `${email} is signed in, but ${planLabel} does not include active app access.`
       }
     >
@@ -923,11 +930,11 @@ export function AppEntitlementGate({
           variant="ghost"
           className="w-full"
         >
-          use different account
+          Use different account
         </Button>
         {refreshError && (
           <p className="font-mono text-[11px] leading-5 text-destructive">
-            refresh failed
+            Refresh failed
           </p>
         )}
       </div>
